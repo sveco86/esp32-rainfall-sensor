@@ -2,6 +2,9 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <esp_timer.h>                 // for esp_timer_get_time()
+#include "freertos/FreeRTOS.h"         // critical sections
+#include "freertos/portmacro.h"
 
 // =======================================================
 //  Private configuration (not in repo, see config_example.h)
@@ -13,7 +16,7 @@
 // =======================================================
 const int   rainfallPin        = 27;       // GPIO27
 const float rainfallPerImpulse = 0.28f;    // mm per tip
-const unsigned long TIP_DEBOUNCE_MS = 50;  // debounce inside ISR
+const unsigned long TIP_DEBOUNCE_MS = 50;  // debounce time (ms)
 
 // =======================================================
 //  Connectivity timing configuration
@@ -26,8 +29,8 @@ const unsigned long MQTT_RETRY_INTERVAL_MS = 3000;
 // =======================================================
 //  State variables
 // =======================================================
-volatile unsigned long impulseCount = 0;
-volatile bool impulseDetectedFlag   = false;
+volatile unsigned long impulseCount = 0;       // updated in ISR
+volatile bool impulseDetectedFlag   = false;   // set in ISR
 
 int lastTrackedHour = -1;
 int lastTrackedWday = -1;
@@ -55,16 +58,21 @@ bool wifiConnecting           = false;
 int  wifiAttemptCount         = 0;
 bool timeInitialized          = false;
 
+// -------- Critical section lock for ISR <-> loop ----------
+portMUX_TYPE rainMux = portMUX_INITIALIZER_UNLOCKED;
+
 // =======================================================
-//  ISR – tipping bucket impulse
+//  ISR – tipping bucket impulse (with ISR-safe debounce)
 // =======================================================
 void IRAM_ATTR handleRainfall() {
-  static unsigned long lastMs = 0;
-  unsigned long now = millis();
-  if (now - lastMs > TIP_DEBOUNCE_MS) {
+  static uint64_t lastUs = 0;                          // last accepted tip time (µs)
+  uint64_t nowUs = esp_timer_get_time();               // ISR-safe, microseconds
+  if (nowUs - lastUs > (uint64_t)TIP_DEBOUNCE_MS * 1000ULL) {
+    portENTER_CRITICAL_ISR(&rainMux);
     impulseCount++;
     impulseDetectedFlag = true;
-    lastMs = now;
+    portEXIT_CRITICAL_ISR(&rainMux);
+    lastUs = nowUs;
   }
 }
 
@@ -192,7 +200,6 @@ void ensureConnectivity() {
         Serial.println("\nMQTT connected");
         if (dayCount > 0) {
           String snapshot = buildWeeklySnapshotJson();
-          // PubSubClient classic: payload must be (const uint8_t*), length, retained
           client.publish(HOURLY_TOPIC,
                          (const uint8_t*)snapshot.c_str(),
                          snapshot.length(),
@@ -226,7 +233,7 @@ void ensureConnectivity() {
 //  MQTT publish helpers
 // =======================================================
 
-// Impulse message (non-retained). QoS is 0 in stock PubSubClient.
+// Impulse message (non-retained). PubSubClient classic -> QoS 0.
 void sendImpulseData(float volume, float hourTotal, const String &timeStr) {
   char payload[160];
   snprintf(payload, sizeof(payload),
@@ -239,7 +246,7 @@ void sendImpulseData(float volume, float hourTotal, const String &timeStr) {
                  false); // not retained
 }
 
-// Called every hour
+// Called every hour: finalize previous hour atomically
 void handleHourRollover() {
   struct tm t;
   if (!nowLocal(t)) return;
@@ -254,9 +261,16 @@ void handleHourRollover() {
 
   char dateStr[11];
   formatDate(prevTm, dateStr);
-  float currentRainfallVolume = impulseCount * rainfallPerImpulse;
-  setHourValue(dateStr, prevHour, currentRainfallVolume);
+
+  // ---- atomic read-and-clear of impulseCount ----
+  unsigned long tips;
+  portENTER_CRITICAL(&rainMux);
+  tips = impulseCount;
   impulseCount = 0;
+  portEXIT_CRITICAL(&rainMux);
+
+  float currentRainfallVolume = tips * rainfallPerImpulse;
+  setHourValue(dateStr, prevHour, currentRainfallVolume);
 
   if (client.connected()) {
     String snapshot = buildWeeklySnapshotJson();
@@ -320,10 +334,18 @@ void loop() {
   ensureConnectivity();
   if (client.connected()) client.loop();
 
-  if (impulseDetectedFlag) {
-    impulseDetectedFlag = false;
+  // --- Handle per-impulse message safely ---
+  bool hadImpulse;
+  unsigned long tipsSnapshot;
+  portENTER_CRITICAL(&rainMux);
+  hadImpulse = impulseDetectedFlag;
+  if (hadImpulse) impulseDetectedFlag = false; // clear flag atomically
+  tipsSnapshot = impulseCount;                 // snapshot for current-hour total
+  portEXIT_CRITICAL(&rainMux);
+
+  if (hadImpulse) {
     String tstr = nowTimeString();
-    float currentHourRainfall = impulseCount * rainfallPerImpulse;
+    float currentHourRainfall = tipsSnapshot * rainfallPerImpulse;
 
     Serial.printf("Rainfall impulse detected at %s | current hour rainfall: %.2f mm\n",
                   tstr.c_str(), currentHourRainfall);
