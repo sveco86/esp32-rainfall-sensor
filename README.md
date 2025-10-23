@@ -53,7 +53,7 @@ The project measures rainfall accurately, handles Wi-Fi reconnects and DST autom
 
 ## ⚙️ MQTT Topics & Payloads
 
-### 🔹 `/test/rainfall/impulse`  *(not retained)*
+### 🔹 `test/rainfall/impulse`  *(not retained)*
 
 Real-time message on every tip:
 
@@ -65,7 +65,7 @@ Real-time message on every tip:
 }
 ```
 
-### 🔹 `/test/rainfall/hourly`  *(retained)*
+### 🔹 `test/rainfall/hourly`  *(retained)*
 ```json
 {
   "17.10.2025": [
