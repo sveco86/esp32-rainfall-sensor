@@ -3,6 +3,10 @@
 A robust, Wi-Fi-connected **ESP32 rainfall monitor** based on the **DFRobot SEN0575 tipping-bucket rain gauge**.  
 The project measures rainfall accurately, handles Wi-Fi reconnects and DST automatically, and publishes live and hourly rainfall data to an MQTT broker for visualization (Home Assistant, Node-RED, Grafana, etc.).
 
+> ⚠️ **Project status:** This project is currently in the **testing and calibration phase**.  
+> Hardware and software are functional, but behavior under long-term outdoor conditions and MQTT performance are still being validated.  
+> Contributions and feedback are welcome!
+
 ---
 
 ## 📦 Features
