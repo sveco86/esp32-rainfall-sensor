@@ -1,3 +1,5 @@
+#define MQTT_MAX_PACKET_SIZE 3072
+
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
