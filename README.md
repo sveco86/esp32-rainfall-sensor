@@ -21,8 +21,8 @@ The project measures rainfall accurately, handles Wi-Fi reconnects and DST autom
 - Keeps a rolling log of **7 days × 24 hours** rainfall totals.  
 
 ✅ **MQTT integration**  
-- `/test/rainfall/impulse` → Real-time impulses with current-hour total.  
-- `/test/rainfall/hourly` → Retained 7-day snapshot with all hourly values.  
+- `test/rainfall/impulse` → Real-time impulses with current-hour total.  
+- `test/rainfall/hourly` → Retained 7-day snapshot with all hourly values.  
 - Messages use the most reliable delivery supported by PubSubClient.  
 
 ✅ **Offline recovery**  
@@ -40,7 +40,7 @@ The project measures rainfall accurately, handles Wi-Fi reconnects and DST autom
 | Component | Model / Description | Connection |
 |------------|--------------------|-------------|
 | **ESP32 DevKit** | ESP-WROOM-32 or WROVER module | Main controller |
-| **Rain gauge** | [DFRobot SEN0575](https://wiki.dfrobot.com/Tipping_Bucket_Rain_Gauge_SKU__SEN0575) tipping-bucket sensor | `Signal → GPIO27`, `GND → GND` |
+| **Rain gauge** | DFRobot SEN0575 tipping-bucket sensor | `Signal → GPIO27`, `GND → GND` |
 | **Power** | 5 V USB or regulated 5 V supply | via ESP32 Vin/USB |
 
 🧩 **SEN0575 notes**
