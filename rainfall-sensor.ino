@@ -1,10 +1,13 @@
-#define MQTT_MAX_PACKET_SIZE 3072
+// ---- MQTT client compile-time limits (set before PubSubClient include) ----
+#define MQTT_MAX_PACKET_SIZE 4096      // headroom for 7×24 JSON (+headers)
+#define MQTT_SOCKET_TIMEOUT   30       // allow more time for retained publishes
 
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #include <esp_timer.h>
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 
@@ -20,8 +23,8 @@ const int   rainfallPin        = 27;       // GPIO27
 const float rainfallPerImpulse = 0.28f;    // mm per tip
 
 // Noise / debounce parameters
-static const uint32_t MIN_LOW_US     = 5000;   // 5 ms minimum valid low
-static const uint32_t REFRACTORY_US  = 20000;  // 20 ms ignore window after valid tip
+static const uint32_t MIN_LOW_US     = 5000;    // 5 ms minimum valid low
+static const uint32_t REFRACTORY_US  = 20000;   // 20 ms ignore window after valid tip
 
 // =======================================================
 //  Connectivity timing configuration
@@ -35,15 +38,15 @@ const unsigned long MQTT_RETRY_INTERVAL_MS = 3000;
 //  State variables
 // =======================================================
 volatile unsigned long impulseCount = 0;
-volatile bool impulseDetectedFlag   = false;
-volatile uint64_t lowStartUs        = 0;
-volatile uint64_t lastValidTipUs    = 0;
+volatile bool          impulseDetectedFlag = false;
+volatile uint64_t      lowStartUs = 0;
+volatile uint64_t      lastValidTipUs = 0;
 
 int lastTrackedHour = -1;
-int lastTrackedWday = -1;
 
+// ---- Rolling 7-day × 24-hour rainfall log ----
 struct DayHours {
-  char  date[11];
+  char  date[11];          // "DD.MM.YYYY"
   float hours[24];
   bool  hasValue[24];
   bool  used;
@@ -67,6 +70,9 @@ bool timeInitialized          = false;
 // Critical-section lock
 portMUX_TYPE rainMux = portMUX_INITIALIZER_UNLOCKED;
 
+// ---- Reusable buffers to avoid heap churn ----
+static char MQTT_OUTBUF[MQTT_MAX_PACKET_SIZE]; // for hourly snapshot
+
 // =======================================================
 //  ISR – tipping-bucket pulse-width filter
 // =======================================================
@@ -77,12 +83,12 @@ void IRAM_ATTR handleRainfall() {
   if (nowUs - lastValidTipUs < REFRACTORY_US) return;
 
   if (level == 0) {
-    if (lowStartUs == 0) lowStartUs = nowUs;          // start timing
+    if (lowStartUs == 0) lowStartUs = nowUs;      // start timing LOW
   } else {
     if (lowStartUs != 0) {
       uint64_t lowDur = nowUs - lowStartUs;
       lowStartUs = 0;
-      if (lowDur >= MIN_LOW_US) {                     // valid tip
+      if (lowDur >= MIN_LOW_US) {                 // valid tip
         portENTER_CRITICAL_ISR(&rainMux);
         impulseCount++;
         impulseDetectedFlag = true;
@@ -124,7 +130,8 @@ int findDayIndexByDate(const char date[11]) {
 int startNewDay(const char date[11]) {
   currentDayPos = (currentDayPos + 1) % 7;
   DayHours &d = weekBuf[currentDayPos];
-  strncpy(d.date, date, 11);
+  strncpy(d.date, date, sizeof(d.date));
+  d.date[sizeof(d.date)-1] = '\0';
   for (int h = 0; h < 24; ++h) { d.hours[h] = 0.0f; d.hasValue[h] = false; }
   d.used = true;
   if (dayCount < 7) dayCount++;
@@ -138,8 +145,12 @@ void setHourValue(const char date[11], int hour, float value) {
   weekBuf[idx].hasValue[hour] = true;
 }
 
-String buildWeeklySnapshotJson() {
-  DynamicJsonDocument doc(8192);
+// Serialize weekly snapshot directly into provided buffer.
+// Returns number of bytes written (0 if not enough space).
+static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
+  // 4 KB is plenty for minified 7×24 payload
+  StaticJsonDocument<4096> doc;
+
   int order[7]; int n = 0;
   if (dayCount > 0) {
     int start = (currentDayPos - (dayCount - 1) + 7) % 7;
@@ -148,6 +159,7 @@ String buildWeeklySnapshotJson() {
       if (weekBuf[idx].used) order[n++] = idx;
     }
   }
+
   for (int oi = 0; oi < n; ++oi) {
     DayHours &d = weekBuf[order[oi]];
     JsonArray arr = doc.createNestedArray(d.date);
@@ -162,20 +174,23 @@ String buildWeeklySnapshotJson() {
       hoursObj[hourKey] = val;
     }
   }
-  String out; serializeJson(doc, out);
-  return out;
+
+  return serializeJson(doc, out, outCap);
 }
 
 // =======================================================
 //  Wi-Fi + MQTT connectivity
 // =======================================================
 void startWifiAttempt(const char *ssid, const char *pwd) {
-  WiFi.disconnect(false, true); delay(50);
+  WiFi.disconnect(false, true);
+  delay(50);
   WiFi.persistent(false);
-  WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
   Serial.printf("Starting WiFi connect to SSID: %s\n", ssid);
   WiFi.begin(ssid, pwd);
-  wifiConnecting = true; lastWifiBegin = millis();
+  wifiConnecting = true;
+  lastWifiBegin  = millis();
 }
 
 void ensureConnectivity() {
@@ -191,18 +206,27 @@ void ensureConnectivity() {
     wifiConnecting = false;
 
     if (!client.connected() && (now - lastMqttAttempt) > MQTT_RETRY_INTERVAL_MS) {
-      lastMqttAttempt = now; client.setServer(MQTT_SERVER, 1883);
+      lastMqttAttempt = now;
+      // setServer once in setup is enough, but harmless here
+      client.setServer(MQTT_SERVER, 1883);
       Serial.print("Connecting to MQTT");
       if (client.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
         Serial.println("\nMQTT connected");
         if (dayCount > 0) {
-          String snapshot = buildWeeklySnapshotJson();
-          client.publish(HOURLY_TOPIC,
-                         (const uint8_t*)snapshot.c_str(),
-                         snapshot.length(),
-                         true); // retained
+          size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
+          if (n == 0 || n >= sizeof(MQTT_OUTBUF) - 1) {
+            Serial.printf("[HOURLY] JSON too large for buffer (%u bytes)\n", (unsigned)n);
+          } else {
+            bool ok = client.publish(HOURLY_TOPIC,
+                                     (const uint8_t*)MQTT_OUTBUF,
+                                     n,
+                                     true); // retained
+            Serial.println(ok ? "[HOURLY] published (retained)" : "[HOURLY] publish FAILED");
+          }
         }
-      } else Serial.print(".");
+      } else {
+        Serial.print(".");
+      }
     }
     return;
   }
@@ -217,7 +241,8 @@ void ensureConnectivity() {
 
   if ((now - lastWifiBegin) > WIFI_RESET_STALE_MS) {
     Serial.println("WiFi stuck connecting → resetting STA");
-    WiFi.disconnect(false, true); delay(100);
+    WiFi.disconnect(false, true);
+    delay(100);
     wifiConnecting = false;
   } else if ((now - lastWifiBegin) > WIFI_BEGIN_INTERVAL_MS) {
     Serial.println("Still connecting...");
@@ -239,47 +264,59 @@ void handleHourRollover() {
   struct tm t; if (!nowLocal(t)) return;
   int hourNow = t.tm_hour;
   int prevHour = (hourNow + 23) % 24;
+
   struct tm prevTm = t;
   if (hourNow == 0) {
-    time_t nowEpoch = time(nullptr); nowEpoch -= 3600; localtime_r(&nowEpoch, &prevTm);
+    time_t nowEpoch = time(nullptr);
+    nowEpoch -= 3600;
+    localtime_r(&nowEpoch, &prevTm);
   }
 
   char dateStr[11]; formatDate(prevTm, dateStr);
 
+  // atomic read-and-clear of impulseCount
   unsigned long tips;
   portENTER_CRITICAL(&rainMux);
-  tips = impulseCount; impulseCount = 0;
+  tips = impulseCount;
+  impulseCount = 0;
   portEXIT_CRITICAL(&rainMux);
 
   float currentRainfallVolume = tips * rainfallPerImpulse;
   setHourValue(dateStr, prevHour, currentRainfallVolume);
 
   if (client.connected()) {
-    String snapshot = buildWeeklySnapshotJson();
-    bool ok = client.publish(HOURLY_TOPIC,
-                             (const uint8_t*)snapshot.c_str(),
-                             snapshot.length(),
-                             true);
-    Serial.println(ok ? "[HOURLY] Weekly snapshot published (retained)" :
-                        "[HOURLY] Publish FAILED");
-  } else Serial.println("[HOURLY] MQTT down, snapshot queued.");
+    size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
+    if (n == 0 || n >= sizeof(MQTT_OUTBUF) - 1) {
+      Serial.printf("[HOURLY] JSON too large for buffer (%u bytes)\n", (unsigned)n);
+    } else {
+      bool ok = client.publish(HOURLY_TOPIC,
+                               (const uint8_t*)MQTT_OUTBUF,
+                               n,
+                               true); // retained
+      Serial.println(ok ? "[HOURLY] Weekly snapshot published (retained)"
+                        : "[HOURLY] Publish FAILED");
+    }
+  } else {
+    Serial.println("[HOURLY] MQTT down, snapshot queued.");
+  }
 }
 
 void maybeSendWeeklySnapshot() {
   struct tm t; if (!nowLocal(t)) return;
-  int hourNow = t.tm_hour; int wdayNow = t.tm_wday;
+  int hourNow = t.tm_hour;
 
   if (lastTrackedHour < 0) {
-    lastTrackedHour = hourNow; lastTrackedWday = wdayNow;
+    lastTrackedHour = hourNow;
     char today[11]; formatDate(t, today);
     if (findDayIndexByDate(today) == -1) startNewDay(today);
     return;
   }
+
   if (hourNow != lastTrackedHour) {
     handleHourRollover();
     char today[11]; formatDate(t, today);
     if (findDayIndexByDate(today) == -1) startNewDay(today);
-    lastTrackedHour = hourNow; lastTrackedWday = wdayNow;
+    lastTrackedHour = hourNow;
   }
 }
 
@@ -287,12 +324,16 @@ void maybeSendWeeklySnapshot() {
 //  Setup / Loop
 // =======================================================
 void setup() {
-  Serial.begin(115200); delay(100);
+  Serial.begin(115200);
+  delay(100);
+  Serial.printf("MQTT_MAX_PACKET_SIZE=%d, MQTT_SOCKET_TIMEOUT=%d\n",
+                MQTT_MAX_PACKET_SIZE, MQTT_SOCKET_TIMEOUT);
 
   for (int i = 0; i < 7; ++i) {
     weekBuf[i].used = false;
     for (int h = 0; h < 24; ++h) {
-      weekBuf[i].hours[h] = 0.0f; weekBuf[i].hasValue[h] = false;
+      weekBuf[i].hours[h] = 0.0f;
+      weekBuf[i].hasValue[h] = false;
     }
   }
 
@@ -307,6 +348,7 @@ void loop() {
   ensureConnectivity();
   if (client.connected()) client.loop();
 
+  // snapshot flags and count safely
   bool hadImpulse;
   unsigned long tipsSnapshot;
   portENTER_CRITICAL(&rainMux);
