@@ -258,6 +258,7 @@ void ensureConnectivity() {
       
       if (client.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
         Serial.println("\n[DEBUG] MQTT connected");
+        client.publish(START_TOPIC, "Device connected", false);
         
         // Publish retained snapshot on reconnect
         if (dayCount > 0) {
