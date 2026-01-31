@@ -15,6 +15,8 @@
 // MQTT Topics
 #define IMPULSE_TOPIC      "test/rainfall/impulse"
 #define HOURLY_TOPIC       "test/rainfall/hourly"
+#define START_TOPIC        "test/rainfall-1/start"
+
 
 // -------------------- Time / NTP --------------------
 // Timezone rule (Europe/Bratislava): CET / CEST automatic DST
