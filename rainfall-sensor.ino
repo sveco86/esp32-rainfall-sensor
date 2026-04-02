@@ -267,7 +267,9 @@ void ensureConnectivity() {
         if (dayCount > 0) {
           size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
           if (n > 0 && n < sizeof(MQTT_OUTBUF) - 1) {
-            client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
+            bool ok = client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
+            Serial.println(ok ? "[HOURLY] Reconnect snapshot published"
+                  : "[HOURLY] Reconnect snapshot publish FAILED");
           }
         }
       } else {
@@ -336,10 +338,20 @@ void handleHourRollover() {
     return;
   }
 
-  int hourNow = t.tm_hour;   // čas ukončenia merania
+  int hourNow = t.tm_hour;   // čas ukončenia intervalu
+
+  // dátum, ku ktorému sa má interval priradiť
+  struct tm assignTm = t;
+
+  // ak je koniec intervalu o 00:00:00, patrí ešte do predchádzajúceho dňa
+  if (hourNow == 0) {
+    time_t ts = mktime(&assignTm);
+    ts -= 1;  // posuň o 1 sekundu späť -> 23:59:59 predchádzajúceho dňa
+    localtime_r(&ts, &assignTm);
+  }
 
   char dateStr[11];
-  formatDate(t, dateStr);    // dátum ukončenia merania
+  formatDate(assignTm, dateStr);
 
   Serial.printf("[DEBUG] handleHourRollover(): endHour=%d date=%s\n",
                 hourNow, dateStr);
@@ -355,14 +367,14 @@ void handleHourRollover() {
   Serial.printf("[DEBUG] handleHourRollover(): tips=%lu volume=%.2f\n",
                 tips, currentRainfallVolume);
 
-  // uložiť pod čas ukončenia intervalu
   setHourValue(dateStr, hourNow, currentRainfallVolume);
 
   if (client.connected()) {
     size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
     if (n > 0 && n < sizeof(MQTT_OUTBUF) - 1) {
       bool ok = client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
-      Serial.println(ok ? "[HOURLY] Weekly snapshot published" : "[HOURLY] Weekly snapshot publish FAILED");
+      Serial.println(ok ? "[HOURLY] Weekly snapshot published"
+                        : "[HOURLY] Weekly snapshot publish FAILED");
     } else {
       Serial.printf("[HOURLY] JSON too large for buffer (%u bytes)\n", (unsigned)n);
     }
