@@ -14,7 +14,7 @@
 // Ensure you have a config.h file with:
 // SSID_PRIMARY, PASS_PRIMARY, SSID_SECONDARY, PASS_SECONDARY
 // MQTT_SERVER, MQTT_USER, MQTT_PASSWORD, MQTT_CLIENT_ID
-// IMPULSE_TOPIC, HOURLY_TOPIC
+// IMPULSE_TOPIC, HOURLY_TOPIC, START_TOPIC
 // NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3, TZ_RULE
 #include "config.h"
 
@@ -53,7 +53,7 @@ int lastTrackedHour = -1;
 
 // ---- Rolling 7-day × 24-hour rainfall log ----
 struct DayHours {
-  char  date[11];          // "DD.MM.YYYY"
+  char  date[11];          // "YYYY-MM-DD"
   float hours[24];
   bool  hasValue[24];
   bool  used;
@@ -128,14 +128,16 @@ bool nowLocal(struct tm &out) {
 }
 
 void formatDate(const struct tm &t, char out[11]) {
-  snprintf(out, 11, "%02d.%02d.%04d", t.tm_mday, t.tm_mon + 1, t.tm_year + 1900);
+  snprintf(out, 11, "%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
 }
 
 String nowTimeString() {
   struct tm t;
-  if (!nowLocal(t)) return String("00:00:00");
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+  if (!nowLocal(t)) return String("1970-01-01T00:00:00");
+  char buf[25];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+           t.tm_hour, t.tm_min, t.tm_sec);
   return String(buf);
 }
 
@@ -194,7 +196,8 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
     JsonObject hoursObj = arr.createNestedObject();
     for (int h = 0; h < 24; ++h) {
       if (!d.hasValue[h]) continue;
-      char hourKey[6]; snprintf(hourKey, sizeof(hourKey), "%d:00", h);
+      char hourKey[9];
+      snprintf(hourKey, sizeof(hourKey), "%02d:00:00", h);
       char val[16];
       float v = d.hours[h];
       if (fabs(v - roundf(v)) < 0.005f) snprintf(val, sizeof(val), "%.0f", v);
@@ -281,7 +284,7 @@ void ensureConnectivity() {
       Serial.println("[DEBUG] WiFi stuck connecting -> Force Resetting WiFi stack");
       
       // Hard reset of the WiFi radio
-      WiFi.disconnect(true); // erase once to clear stack
+      WiFi.disconnect(true); // hard reset WiFi connection state
       delay(100);
       WiFi.mode(WIFI_OFF);   // Turn radio off completely
       delay(100);
@@ -328,23 +331,18 @@ void sendImpulseData(float volume, float hourTotal, const String &timeStr) {
 
 void handleHourRollover() {
   struct tm t;
-  if (!nowLocal(t)) return;
-
-  int hourNow  = t.tm_hour;
-  int prevHour = (hourNow + 23) % 24;
-
-  struct tm prevTm = t;
-  if (hourNow == 0) {
-    time_t nowEpoch = time(nullptr);
-    nowEpoch -= 3600;
-    localtime_r(&nowEpoch, &prevTm);
+  if (!nowLocal(t)) {
+    Serial.println("[DEBUG] nowLocal() failed in handleHourRollover()");
+    return;
   }
 
-  char dateStr[11];
-  formatDate(prevTm, dateStr);
+  int hourNow = t.tm_hour;   // čas ukončenia merania
 
-  Serial.printf("[DEBUG] handleHourRollover(): prevHour=%d date=%s\n",
-                prevHour, dateStr);
+  char dateStr[11];
+  formatDate(t, dateStr);    // dátum ukončenia merania
+
+  Serial.printf("[DEBUG] handleHourRollover(): endHour=%d date=%s\n",
+                hourNow, dateStr);
 
   // atomic read-and-clear
   unsigned long tips;
@@ -354,13 +352,19 @@ void handleHourRollover() {
   portEXIT_CRITICAL(&rainMux);
 
   float currentRainfallVolume = tips * rainfallPerImpulse;
-  setHourValue(dateStr, prevHour, currentRainfallVolume);
+  Serial.printf("[DEBUG] handleHourRollover(): tips=%lu volume=%.2f\n",
+                tips, currentRainfallVolume);
+
+  // uložiť pod čas ukončenia intervalu
+  setHourValue(dateStr, hourNow, currentRainfallVolume);
 
   if (client.connected()) {
     size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
     if (n > 0 && n < sizeof(MQTT_OUTBUF) - 1) {
-      client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true); // retained
-      Serial.println("[HOURLY] Weekly snapshot published");
+      bool ok = client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
+      Serial.println(ok ? "[HOURLY] Weekly snapshot published" : "[HOURLY] Weekly snapshot publish FAILED");
+    } else {
+      Serial.printf("[HOURLY] JSON too large for buffer (%u bytes)\n", (unsigned)n);
     }
   } else {
     Serial.println("[HOURLY] MQTT down, snapshot queued.");
