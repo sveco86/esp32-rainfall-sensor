@@ -31,7 +31,11 @@ The project measures rainfall accurately, handles Wi-Fi reconnects and DST autom
 
 ✅ **Resilient Wi-Fi**  
 - Automatically switches between primary and backup SSID.  
-- Detects stuck connection attempts and resets the interface.  
+- Detects stuck connection attempts and resets the interface.
+
+✅ **OTA updates** 
+- Used ElegantOTA library
+
 
 ---
 
