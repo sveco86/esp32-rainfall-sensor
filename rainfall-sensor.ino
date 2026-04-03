@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <WebServer.h>
+#include <ElegantOTA.h>
 #include <time.h>
 #include <esp_timer.h>
 #include <math.h>
@@ -16,6 +18,7 @@
 // MQTT_SERVER, MQTT_USER, MQTT_PASSWORD, MQTT_CLIENT_ID
 // IMPULSE_TOPIC, HOURLY_TOPIC, START_TOPIC
 // NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3, TZ_RULE
+// OTA_WEB_USERNAME, OTA_WEB_PASSWORD
 #include "config.h"
 
 // =======================================================
@@ -36,9 +39,9 @@ static const uint32_t REFRACTORY_US  = 20000;   // 20 ms ignore window after val
 // =======================================================
 //  Connectivity timing configuration
 // =======================================================
-const unsigned long WIFI_CHECK_INTERVAL_MS = 500;   // Check status more frequently
-const unsigned long WIFI_BEGIN_INTERVAL_MS = 15000; // Time to wait for connection
-const unsigned long WIFI_RESET_STALE_MS    = 30000; // Force radio reset if stuck here
+const unsigned long WIFI_CHECK_INTERVAL_MS = 500;
+const unsigned long WIFI_BEGIN_INTERVAL_MS = 15000;
+const unsigned long WIFI_RESET_STALE_MS    = 30000;
 const unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
 
 // =======================================================
@@ -67,18 +70,57 @@ int dayCount      = 0;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+// Web OTA
+WebServer server(80);
+
 unsigned long lastWifiCheck   = 0;
 unsigned long lastWifiBegin   = 0;
 unsigned long lastMqttAttempt = 0;
 bool wifiConnecting           = false;
 int  wifiAttemptCount         = 0;
 bool timeInitialized          = false;
+bool webOtaInitialized        = false;
 
 // Critical-section lock
 portMUX_TYPE rainMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ---- Reusable buffer ----
-static char MQTT_OUTBUF[MQTT_BUFFER_SIZE]; 
+static char MQTT_OUTBUF[MQTT_BUFFER_SIZE];
+
+// =======================================================
+//  Web OTA
+// =======================================================
+void initWebOTA() {
+  server.on("/", HTTP_GET, []() {
+    String html;
+    html += "<html><head><meta charset='utf-8'><title>ESP32 Rainfall Sensor</title></head><body>";
+    html += "<h2>ESP32 Rainfall Sensor</h2>";
+    html += "<p>Web OTA is enabled.</p>";
+    html += "<p><a href='/update'>Open OTA Update page</a></p>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  ElegantOTA.setAuth(OTA_WEB_USERNAME, OTA_WEB_PASSWORD);
+  ElegantOTA.begin(&server);
+
+  ElegantOTA.onStart([]() {
+    Serial.println("[OTA-WEB] Start");
+  });
+
+  ElegantOTA.onProgress([](size_t current, size_t final) {
+    if (final > 0) {
+      Serial.printf("[OTA-WEB] Progress: %u%%\n", (unsigned)((current * 100U) / final));
+    }
+  });
+
+  server.begin();
+  webOtaInitialized = true;
+
+  Serial.println("[OTA-WEB] Ready");
+  Serial.printf("[OTA-WEB] Open: http://%s/\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[OTA-WEB] Update page: http://%s/update\n", WiFi.localIP().toString().c_str());
+}
 
 // =======================================================
 //  ISR – tipping-bucket pulse-width filter
@@ -90,12 +132,12 @@ void IRAM_ATTR handleRainfall() {
   if (nowUs - lastValidTipUs < REFRACTORY_US) return;
 
   if (level == 0) {
-    if (lowStartUs == 0) lowStartUs = nowUs;      
+    if (lowStartUs == 0) lowStartUs = nowUs;
   } else {
     if (lowStartUs != 0) {
       uint64_t lowDur = nowUs - lowStartUs;
       lowStartUs = 0;
-      if (lowDur >= MIN_LOW_US) {                 
+      if (lowDur >= MIN_LOW_US) {
         portENTER_CRITICAL_ISR(&rainMux);
         impulseCount++;
         impulseDetectedFlag = true;
@@ -116,7 +158,6 @@ void initTime() {
 
 bool nowLocal(struct tm &out) {
   if (!getLocalTime(&out, 1000)) {
-    // Only print error occasionally to avoid serial spam
     static unsigned long lastErr = 0;
     if (millis() - lastErr > 10000) {
       Serial.println("[DEBUG] getLocalTime() failed");
@@ -177,10 +218,9 @@ void setHourValue(const char date[11], int hour, float value) {
 
 // Serialize weekly snapshot
 static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
-  // Use heap for JSON doc to avoid large stack usage
   DynamicJsonDocument doc(8192);
 
-  int order[7]; 
+  int order[7];
   int n = 0;
   if (dayCount > 0) {
     int start = (currentDayPos - (dayCount - 1) + 7) % 7;
@@ -205,28 +245,23 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
       hoursObj[hourKey] = val;
     }
   }
+
   return serializeJson(doc, out, outCap);
 }
 
 // =======================================================
-//  Wi-Fi + MQTT connectivity (FIXED)
+//  Wi-Fi + MQTT connectivity
 // =======================================================
 void startWifiAttempt(const char *ssid, const char *pwd) {
-  // FIX 1: Don't use 'true' in disconnect (avoids flash erase)
-  WiFi.disconnect(); 
-  
-  // FIX 2: Set mode explicitly
+  WiFi.disconnect();
   WiFi.mode(WIFI_STA);
-  
-  // FIX 3: Disable WiFi power saving to prevent router disconnects
-  WiFi.setSleep(false); 
-
-  WiFi.persistent(false); // Don't save new credentials to flash
+  WiFi.setSleep(false);
+  WiFi.persistent(false);
   WiFi.setAutoReconnect(false);
-  
+
   Serial.printf("[DEBUG] Starting WiFi connect to SSID: %s\n", ssid);
   WiFi.begin(ssid, pwd);
-  
+
   wifiConnecting = true;
   lastWifiBegin  = millis();
 }
@@ -238,38 +273,46 @@ void ensureConnectivity() {
 
   wl_status_t st = WiFi.status();
 
-  // --- Case 1: Fully Connected ---
   if (st == WL_CONNECTED) {
     if (wifiConnecting) {
-      Serial.printf("[DEBUG] WiFi connected, IP: %s, RSSI: %d\n", 
+      Serial.printf("[DEBUG] WiFi connected, IP: %s, RSSI: %d\n",
                     WiFi.localIP().toString().c_str(), WiFi.RSSI());
       wifiConnecting = false;
-      wifiAttemptCount = 0; 
+      wifiAttemptCount = 0;
 
       if (!timeInitialized) {
         initTime();
         timeInitialized = true;
         Serial.println("[DEBUG] Time initialized");
       }
+
+      if (!webOtaInitialized) {
+        initWebOTA();
+      }
     }
 
-    // Handle MQTT
     if (!client.connected() && (now - lastMqttAttempt) > MQTT_RETRY_INTERVAL_MS) {
       lastMqttAttempt = now;
       client.setServer(MQTT_SERVER, 1883);
       Serial.print("[DEBUG] Connecting to MQTT");
-      
+
       if (client.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
         Serial.println("\n[DEBUG] MQTT connected");
-        client.publish(START_TOPIC, "Device connected", false);
-        
-        // Publish retained snapshot on reconnect
+        {
+          String tstr = nowTimeString();
+          char payload[96];
+          snprintf(payload, sizeof(payload),
+                  "{\"status\":\"connected\",\"time\":\"%s\"}",
+                  tstr.c_str());
+          client.publish(START_TOPIC, (const uint8_t*)payload, strlen(payload), false);
+        }
+
         if (dayCount > 0) {
           size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
           if (n > 0 && n < sizeof(MQTT_OUTBUF) - 1) {
             bool ok = client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
             Serial.println(ok ? "[HOURLY] Reconnect snapshot published"
-                  : "[HOURLY] Reconnect snapshot publish FAILED");
+                              : "[HOURLY] Reconnect snapshot publish FAILED");
           }
         }
       } else {
@@ -279,36 +322,31 @@ void ensureConnectivity() {
     return;
   }
 
-  // --- Case 2: Currently connecting (wait phase) ---
   if (wifiConnecting) {
-    // If it has been too long (Stuck connecting state)
     if ((now - lastWifiBegin) > WIFI_RESET_STALE_MS) {
       Serial.println("[DEBUG] WiFi stuck connecting -> Force Resetting WiFi stack");
-      
-      // Hard reset of the WiFi radio
-      WiFi.disconnect(true); // hard reset WiFi connection state
+      WiFi.disconnect(true);
       delay(100);
-      WiFi.mode(WIFI_OFF);   // Turn radio off completely
+      WiFi.mode(WIFI_OFF);
       delay(100);
-      
-      wifiConnecting = false; // Allow the next block to restart the process
-    } 
+      wifiConnecting = false;
+      webOtaInitialized = false;
+    }
     else if ((now - lastWifiBegin) > WIFI_BEGIN_INTERVAL_MS) {
-       Serial.println("[DEBUG] Connection timed out (soft). marking as failed.");
-       wifiConnecting = false;
+      Serial.println("[DEBUG] Connection timed out (soft). marking as failed.");
+      wifiConnecting = false;
+      webOtaInitialized = false;
     }
     else {
-      // Still waiting, do nothing (or print dot)
       return;
     }
   }
 
-  // --- Case 3: Disconnected and not currently trying (Start new attempt) ---
   if (!wifiConnecting) {
     const bool usePrimary = (wifiAttemptCount % 2 == 0);
     Serial.printf("\n[DEBUG] WiFi lost/init. Trying %s (Attempt %d)\n",
                   usePrimary ? "Primary" : "Secondary", wifiAttemptCount);
-    
+
     startWifiAttempt(usePrimary ? SSID_PRIMARY : SSID_SECONDARY,
                      usePrimary ? PASS_PRIMARY : PASS_SECONDARY);
     wifiAttemptCount++;
@@ -324,10 +362,9 @@ void sendImpulseData(float volume, float hourTotal, const String &timeStr) {
            "{\"volume\":%.2f,\"hour_total\":%.2f,\"time\":\"%s\"}",
            volume, hourTotal, timeStr.c_str());
   bool ok = client.publish(IMPULSE_TOPIC, (const uint8_t*)payload, strlen(payload), false);
-  
+
   if (!ok) {
     Serial.println("[DEBUG] Impulse publish failed");
-    // Don't force disconnect here, let ensureConnectivity handle it
   }
 }
 
@@ -338,15 +375,12 @@ void handleHourRollover() {
     return;
   }
 
-  int hourNow = t.tm_hour;   // čas ukončenia intervalu
+  int hourNow = t.tm_hour;
 
-  // dátum, ku ktorému sa má interval priradiť
   struct tm assignTm = t;
-
-  // ak je koniec intervalu o 00:00:00, patrí ešte do predchádzajúceho dňa
   if (hourNow == 0) {
     time_t ts = mktime(&assignTm);
-    ts -= 1;  // posuň o 1 sekundu späť -> 23:59:59 predchádzajúceho dňa
+    ts -= 1;
     localtime_r(&ts, &assignTm);
   }
 
@@ -356,7 +390,6 @@ void handleHourRollover() {
   Serial.printf("[DEBUG] handleHourRollover(): endHour=%d date=%s\n",
                 hourNow, dateStr);
 
-  // atomic read-and-clear
   unsigned long tips;
   portENTER_CRITICAL(&rainMux);
   tips = impulseCount;
@@ -386,12 +419,13 @@ void handleHourRollover() {
 void maybeSendWeeklySnapshot() {
   struct tm t;
   if (!nowLocal(t)) return;
-  
+
   int hourNow = t.tm_hour;
 
   if (lastTrackedHour < 0) {
     lastTrackedHour = hourNow;
-    char today[11]; formatDate(t, today);
+    char today[11];
+    formatDate(t, today);
     if (findDayIndexByDate(today) == -1) startNewDay(today);
     Serial.printf("[DEBUG] Init lastTrackedHour=%d\n", hourNow);
     return;
@@ -400,7 +434,8 @@ void maybeSendWeeklySnapshot() {
   if (hourNow != lastTrackedHour) {
     Serial.printf("[DEBUG] Hour change: %d -> %d\n", lastTrackedHour, hourNow);
     handleHourRollover();
-    char today[11]; formatDate(t, today);
+    char today[11];
+    formatDate(t, today);
     if (findDayIndexByDate(today) == -1) startNewDay(today);
     lastTrackedHour = hourNow;
   }
@@ -411,7 +446,7 @@ void maybeSendWeeklySnapshot() {
 // =======================================================
 void setup() {
   Serial.begin(115200);
-  delay(500); 
+  delay(500);
   Serial.printf("[DEBUG] Boot. MQTT_BUFFER_SIZE=%d\n", MQTT_BUFFER_SIZE);
 
   for (int i = 0; i < 7; ++i) {
@@ -428,18 +463,20 @@ void setup() {
   client.setServer(MQTT_SERVER, 1883);
   client.setBufferSize(MQTT_BUFFER_SIZE + 512);
 
-  // Initial State: Radio OFF to clear any weird hardware states
   WiFi.mode(WIFI_OFF);
-  
-  // Start connection
   startWifiAttempt(SSID_PRIMARY, PASS_PRIMARY);
 }
 
 void loop() {
   ensureConnectivity();
+
+  if (WiFi.status() == WL_CONNECTED && webOtaInitialized) {
+    server.handleClient();
+    ElegantOTA.loop();
+  }
+
   if (client.connected()) client.loop();
 
-  // snapshot flags safely
   bool hadImpulse;
   unsigned long tipsSnapshot;
   portENTER_CRITICAL(&rainMux);
@@ -453,10 +490,10 @@ void loop() {
     float currentHourRainfall = tipsSnapshot * rainfallPerImpulse;
     Serial.printf("Rainfall impulse detected at %s | current hour: %.2f mm\n",
                   tstr.c_str(), currentHourRainfall);
-    
-    // Only try to publish if connected; don't force disconnects here
-    if (client.connected())
+
+    if (client.connected()) {
       sendImpulseData(rainfallPerImpulse, currentHourRainfall, tstr);
+    }
   }
 
   maybeSendWeeklySnapshot();
