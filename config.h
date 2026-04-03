@@ -17,6 +17,9 @@
 #define HOURLY_TOPIC       "test/rainfall/hourly"
 #define START_TOPIC        "test/rainfall-1/start"
 
+// -------------------- OTA settings --------------------
+#define OTA_WEB_USERNAME "rainfall-sensor1"
+#define OTA_WEB_PASSWORD "passwd"
 
 // -------------------- Time / NTP --------------------
 // Timezone rule (Europe/Bratislava): CET / CEST automatic DST
