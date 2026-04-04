@@ -234,16 +234,33 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
     DayHours &d = weekBuf[order[oi]];
     JsonArray arr = doc.createNestedArray(d.date);
     JsonObject hoursObj = arr.createNestedObject();
+   
     for (int h = 0; h < 24; ++h) {
       if (!d.hasValue[h]) continue;
+
       char hourKey[9];
-      snprintf(hourKey, sizeof(hourKey), "%02d:00:00", h);
+
+      // slot h reprezentuje interval končiaci v h:00:00
+      // vo výstupe chceme "koniec intervalu mínus 1 sekunda"
+      // teda:
+      //   1 -> 00:59:59
+      //   2 -> 01:59:59
+      //   ...
+      //   0 -> 23:59:59
+      int displayHour = (h + 23) % 24;
+      snprintf(hourKey, sizeof(hourKey), "%02d:59:59", displayHour);
+
       char val[16];
       float v = d.hours[h];
-      if (fabs(v - roundf(v)) < 0.005f) snprintf(val, sizeof(val), "%.0f", v);
-      else snprintf(val, sizeof(val), "%.2f", v);
+      if (fabs(v - roundf(v)) < 0.005f) {
+        snprintf(val, sizeof(val), "%.0f", v);
+      } else {
+        snprintf(val, sizeof(val), "%.2f", v);
+      }
+
       hoursObj[hourKey] = val;
     }
+  
   }
 
   return serializeJson(doc, out, outCap);
