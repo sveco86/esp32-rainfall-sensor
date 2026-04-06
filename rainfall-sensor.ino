@@ -136,6 +136,12 @@ void unregisterWatchdogForCurrentTask() {
   }
 }
 
+void applyTimezone() {
+  setenv("TZ", TZ_RULE, 1);
+  tzset();
+  Serial.printf("[DEBUG] Timezone applied: %s\n", TZ_RULE);
+}
+
 // =======================================================
 //  Web OTA
 // =======================================================
@@ -208,15 +214,12 @@ void IRAM_ATTR handleRainfall() {
 // =======================================================
 void startNtpSync() {
   Serial.println("[DEBUG] startNtpSync(): calling configTzTime()");
-  setenv("TZ", TZ_RULE, 1);
-  tzset();
   configTzTime(TZ_RULE, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
   ntpRequestStarted = true;
   lastNtpAttempt = millis();
 }
 
 void maintainTimeSync() {
-  // No Wi-Fi: do nothing, do NOT invalidate rainfallClockReady/timeValid.
   if (WiFi.status() != WL_CONNECTED) {
     return;
   }
@@ -257,13 +260,7 @@ String nowTimeString() {
   if (!nowLocal(t)) return String("1970-01-01T00:00:00");
 
   char buf[25];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
-           t.tm_year + 1900,
-           t.tm_mon + 1,
-           t.tm_mday,
-           t.tm_hour,
-           t.tm_min,
-           t.tm_sec);
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &t);
   return String(buf);
 }
 
@@ -337,9 +334,7 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
       }
     }
 
-    if (!hasAnyHour) {
-      continue;
-    }
+    if (!hasAnyHour) continue;
 
     JsonArray arr = doc[d.date].to<JsonArray>();
     JsonObject hoursObj = arr.add<JsonObject>();
@@ -379,7 +374,6 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
   size_t jsonLen = measureJson(doc);
   Serial.printf("[DEBUG] JSON measured size: %u bytes (buffer: %u)\n",
                 (unsigned)jsonLen, (unsigned)outCap);
-  Serial.printf("[DEBUG] Free heap during JSON build: %u bytes\n", ESP.getFreeHeap());
 
   if (jsonLen >= outCap) {
     Serial.println("[ERROR] JSON does not fit into MQTT buffer!");
@@ -392,7 +386,6 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
     return 0;
   }
 
-  Serial.printf("[DEBUG] JSON serialized size: %u bytes\n", (unsigned)written);
   return written;
 }
 
@@ -614,6 +607,8 @@ void setup() {
   Serial.printf("[DEBUG] Boot. MQTT_BUFFER_SIZE=%d\n", MQTT_BUFFER_SIZE);
   Serial.printf("[BOOT] Reset reason: %s\n", resetReasonToStr(esp_reset_reason()));
   Serial.printf("[DEBUG] Free heap at boot: %u bytes\n", ESP.getFreeHeap());
+
+  applyTimezone();
 
   esp_task_wdt_config_t twdt_config = {
     .timeout_ms = WDT_TIMEOUT_MS,
