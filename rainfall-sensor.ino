@@ -208,6 +208,8 @@ void IRAM_ATTR handleRainfall() {
 // =======================================================
 void startNtpSync() {
   Serial.println("[DEBUG] startNtpSync(): calling configTzTime()");
+  setenv("TZ", TZ_RULE, 1);
+  tzset();
   configTzTime(TZ_RULE, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
   ntpRequestStarted = true;
   lastNtpAttempt = millis();
@@ -225,6 +227,7 @@ void maintainTimeSync() {
   }
 
   timeValid = false;
+  rainfallClockReady = false;
 
   const unsigned long nowMs = millis();
   if (!ntpRequestStarted || (nowMs - lastNtpAttempt) >= NTP_RETRY_INTERVAL_MS) {
@@ -251,10 +254,16 @@ void formatDate(const struct tm &t, char out[11]) {
 
 String nowTimeString() {
   struct tm t;
-  if (!nowLocal(t)) return String("1970-01-01T00:00:00+0000");
+  if (!nowLocal(t)) return String("1970-01-01T00:00:00");
 
-  char buf[32];
-  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &t);
+  char buf[25];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+           t.tm_year + 1900,
+           t.tm_mon + 1,
+           t.tm_mday,
+           t.tm_hour,
+           t.tm_min,
+           t.tm_sec);
   return String(buf);
 }
 
@@ -357,7 +366,7 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
   }
 
   if (daysAdded == 0) {
-    Serial.println("[DEBUG] No hourly data yet, snapshot not published");
+    Serial.println("[DEBUG] No hourly values yet, skipping empty snapshot");
     return 0;
   }
 
@@ -370,6 +379,7 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
   size_t jsonLen = measureJson(doc);
   Serial.printf("[DEBUG] JSON measured size: %u bytes (buffer: %u)\n",
                 (unsigned)jsonLen, (unsigned)outCap);
+  Serial.printf("[DEBUG] Free heap during JSON build: %u bytes\n", ESP.getFreeHeap());
 
   if (jsonLen >= outCap) {
     Serial.println("[ERROR] JSON does not fit into MQTT buffer!");
@@ -382,6 +392,7 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
     return 0;
   }
 
+  Serial.printf("[DEBUG] JSON serialized size: %u bytes\n", (unsigned)written);
   return written;
 }
 
@@ -447,7 +458,7 @@ void ensureConnectivity() {
             Serial.println(ok ? "[HOURLY] Reconnect snapshot published"
                               : "[HOURLY] Reconnect snapshot publish FAILED");
           } else {
-            Serial.println("[HOURLY] Snapshot not published on reconnect");
+            Serial.println("[HOURLY] No non-empty snapshot to publish on reconnect");
           }
         }
       } else {
@@ -544,7 +555,7 @@ void handleHourRollover() {
       Serial.println(ok ? "[HOURLY] Weekly snapshot published"
                         : "[HOURLY] Weekly snapshot publish FAILED");
     } else {
-      Serial.println("[HOURLY] Snapshot not published");
+      Serial.println("[HOURLY] No non-empty snapshot to publish");
     }
   } else {
     Serial.println("[HOURLY] MQTT down, snapshot queued.");
@@ -553,7 +564,7 @@ void handleHourRollover() {
 
 void maybeSendWeeklySnapshot() {
   struct tm t;
-  if (!timeValid || !nowLocal(t)) {
+  if (!nowLocal(t) || !isTimeSanityCheckOk()) {
     static unsigned long lastWarn = 0;
     if (millis() - lastWarn > 30000) {
       Serial.println("[DEBUG] maybeSendWeeklySnapshot(): no valid local time yet");
