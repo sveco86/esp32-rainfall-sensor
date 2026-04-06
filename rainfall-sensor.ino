@@ -5,6 +5,7 @@
 #include <ElegantOTA.h>
 #include <time.h>
 #include <esp_timer.h>
+#include <esp_task_wdt.h>
 #include <math.h>
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -13,18 +14,12 @@
 // =======================================================
 //  Private configuration
 // =======================================================
-// Ensure you have a config.h file with:
-// SSID_PRIMARY, PASS_PRIMARY, SSID_SECONDARY, PASS_SECONDARY
-// MQTT_SERVER, MQTT_USER, MQTT_PASSWORD, MQTT_CLIENT_ID
-// IMPULSE_TOPIC, HOURLY_TOPIC, START_TOPIC
-// NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3, TZ_RULE
-// OTA_WEB_USERNAME, OTA_WEB_PASSWORD
 #include "config.h"
 
 // =======================================================
 //  MQTT buffer config
 // =======================================================
-#define MQTT_BUFFER_SIZE 4096
+#define MQTT_BUFFER_SIZE 8192
 
 // =======================================================
 //  Rain gauge setup
@@ -43,6 +38,12 @@ const unsigned long WIFI_CHECK_INTERVAL_MS = 500;
 const unsigned long WIFI_BEGIN_INTERVAL_MS = 15000;
 const unsigned long WIFI_RESET_STALE_MS    = 30000;
 const unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
+const unsigned long NTP_RETRY_INTERVAL_MS  = 60000;
+
+// =======================================================
+//  Watchdog configuration
+// =======================================================
+static const uint32_t WDT_TIMEOUT_MS = 10000;
 
 // =======================================================
 //  State variables
@@ -52,7 +53,9 @@ volatile bool          impulseDetectedFlag = false;
 volatile uint64_t      lowStartUs          = 0;
 volatile uint64_t      lastValidTipUs      = 0;
 
-int lastTrackedHour = -1;
+int  lastTrackedHour    = -1;
+bool wdtRegistered      = false;
+bool rainfallClockReady = false;
 
 // ---- Rolling 7-day × 24-hour rainfall log ----
 struct DayHours {
@@ -78,7 +81,9 @@ unsigned long lastWifiBegin   = 0;
 unsigned long lastMqttAttempt = 0;
 bool wifiConnecting           = false;
 int  wifiAttemptCount         = 0;
-bool timeInitialized          = false;
+bool ntpRequestStarted        = false;
+bool timeValid                = false;
+unsigned long lastNtpAttempt  = 0;
 bool webOtaInitialized        = false;
 
 // Critical-section lock
@@ -86,6 +91,50 @@ portMUX_TYPE rainMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ---- Reusable buffer ----
 static char MQTT_OUTBUF[MQTT_BUFFER_SIZE];
+
+// =======================================================
+//  Helpers
+// =======================================================
+const char* resetReasonToStr(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    default:                return "UNKNOWN";
+  }
+}
+
+bool isTimeSanityCheckOk() {
+  time_t now = time(nullptr);
+  if (now <= 0) return false;
+
+  struct tm t;
+  if (localtime_r(&now, &t) == nullptr) return false;
+
+  return (t.tm_year >= 124);   // 2024+
+}
+
+void registerWatchdogForCurrentTask() {
+  if (!wdtRegistered) {
+    esp_task_wdt_add(NULL);
+    wdtRegistered = true;
+    Serial.println("[WDT] Registered current task");
+  }
+}
+
+void unregisterWatchdogForCurrentTask() {
+  if (wdtRegistered) {
+    esp_task_wdt_delete(NULL);
+    wdtRegistered = false;
+    Serial.println("[WDT] Unregistered current task");
+  }
+}
 
 // =======================================================
 //  Web OTA
@@ -105,6 +154,7 @@ void initWebOTA() {
   ElegantOTA.begin(&server);
 
   ElegantOTA.onStart([]() {
+    unregisterWatchdogForCurrentTask();
     Serial.println("[OTA-WEB] Start");
   });
 
@@ -112,6 +162,11 @@ void initWebOTA() {
     if (final > 0) {
       Serial.printf("[OTA-WEB] Progress: %u%%\n", (unsigned)((current * 100U) / final));
     }
+  });
+
+  ElegantOTA.onEnd([](bool success) {
+    registerWatchdogForCurrentTask();
+    Serial.printf("[OTA-WEB] End. Success=%s\n", success ? "true" : "false");
   });
 
   server.begin();
@@ -151,9 +206,32 @@ void IRAM_ATTR handleRainfall() {
 // =======================================================
 //  Time helpers
 // =======================================================
-void initTime() {
-  Serial.println("[DEBUG] initTime(): calling configTzTime()");
+void startNtpSync() {
+  Serial.println("[DEBUG] startNtpSync(): calling configTzTime()");
   configTzTime(TZ_RULE, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+  ntpRequestStarted = true;
+  lastNtpAttempt = millis();
+}
+
+void maintainTimeSync() {
+  // No Wi-Fi: do nothing, do NOT invalidate rainfallClockReady/timeValid.
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (isTimeSanityCheckOk()) {
+    timeValid = true;
+    return;
+  }
+
+  timeValid = false;
+  rainfallClockReady = false;
+
+  const unsigned long nowMs = millis();
+  if (!ntpRequestStarted || (nowMs - lastNtpAttempt) >= NTP_RETRY_INTERVAL_MS) {
+    Serial.println("[DEBUG] Time invalid, retrying NTP sync");
+    startNtpSync();
+  }
 }
 
 bool nowLocal(struct tm &out) {
@@ -174,11 +252,10 @@ void formatDate(const struct tm &t, char out[11]) {
 
 String nowTimeString() {
   struct tm t;
-  if (!nowLocal(t)) return String("1970-01-01T00:00:00");
-  char buf[25];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
-           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-           t.tm_hour, t.tm_min, t.tm_sec);
+  if (!nowLocal(t)) return String("1970-01-01T00:00:00+0000");
+
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &t);
   return String(buf);
 }
 
@@ -186,8 +263,9 @@ String nowTimeString() {
 //  7-day rainfall storage
 // =======================================================
 int findDayIndexByDate(const char date[11]) {
-  for (int i = 0; i < 7; ++i)
+  for (int i = 0; i < 7; ++i) {
     if (weekBuf[i].used && strncmp(weekBuf[i].date, date, 11) == 0) return i;
+  }
   return -1;
 }
 
@@ -195,13 +273,16 @@ int startNewDay(const char date[11]) {
   currentDayPos = (currentDayPos + 1) % 7;
   DayHours &d = weekBuf[currentDayPos];
   strncpy(d.date, date, sizeof(d.date));
-  d.date[sizeof(d.date)-1] = '\0';
+  d.date[sizeof(d.date) - 1] = '\0';
+
   for (int h = 0; h < 24; ++h) {
     d.hours[h] = 0.0f;
     d.hasValue[h] = false;
   }
+
   d.used = true;
   if (dayCount < 7) dayCount++;
+
   Serial.printf("[DEBUG] startNewDay(): index=%d date=%s dayCount=%d\n",
                 currentDayPos, d.date, dayCount);
   return currentDayPos;
@@ -210,18 +291,23 @@ int startNewDay(const char date[11]) {
 void setHourValue(const char date[11], int hour, float value) {
   int idx = findDayIndexByDate(date);
   if (idx == -1) idx = startNewDay(date);
+
   weekBuf[idx].hours[hour] = value;
   weekBuf[idx].hasValue[hour] = true;
+
   Serial.printf("[DEBUG] setHourValue(): date=%s hour=%d value=%.2f (idx=%d)\n",
                 date, hour, value, idx);
 }
 
-// Serialize weekly snapshot
+// =======================================================
+//  Serialize weekly snapshot
+// =======================================================
 static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
-  DynamicJsonDocument doc(8192);
+  JsonDocument doc;
 
   int order[7];
   int n = 0;
+
   if (dayCount > 0) {
     int start = (currentDayPos - (dayCount - 1) + 7) % 7;
     for (int i = 0; i < dayCount; ++i) {
@@ -232,21 +318,13 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
 
   for (int oi = 0; oi < n; ++oi) {
     DayHours &d = weekBuf[order[oi]];
-    JsonArray arr = doc.createNestedArray(d.date);
-    JsonObject hoursObj = arr.createNestedObject();
-   
+    JsonArray arr = doc[d.date].to<JsonArray>();
+    JsonObject hoursObj = arr.add<JsonObject>();
+
     for (int h = 0; h < 24; ++h) {
       if (!d.hasValue[h]) continue;
 
       char hourKey[9];
-
-      // slot h reprezentuje interval končiaci v h:00:00
-      // vo výstupe chceme "koniec intervalu mínus 1 sekunda"
-      // teda:
-      //   1 -> 00:59:59
-      //   2 -> 01:59:59
-      //   ...
-      //   0 -> 23:59:59
       int displayHour = (h + 23) % 24;
       snprintf(hourKey, sizeof(hourKey), "%02d:59:59", displayHour);
 
@@ -260,17 +338,40 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
 
       hoursObj[hourKey] = val;
     }
-  
   }
 
-  return serializeJson(doc, out, outCap);
+  if (doc.overflowed()) {
+    Serial.println("[ERROR] JSON document overflowed!");
+    Serial.printf("[DEBUG] Free heap at overflow: %u bytes\n", ESP.getFreeHeap());
+    return 0;
+  }
+
+  size_t jsonLen = measureJson(doc);
+  Serial.printf("[DEBUG] JSON measured size: %u bytes (buffer: %u)\n",
+                (unsigned)jsonLen, (unsigned)outCap);
+  Serial.printf("[DEBUG] Free heap during JSON build: %u bytes\n", ESP.getFreeHeap());
+
+  if (jsonLen >= outCap) {
+    Serial.println("[ERROR] JSON does not fit into MQTT buffer!");
+    return 0;
+  }
+
+  size_t written = serializeJson(doc, out, outCap);
+  Serial.printf("[DEBUG] JSON serialized size: %u bytes\n", (unsigned)written);
+
+  if (written == 0) {
+    Serial.println("[ERROR] serializeJson() failed");
+    return 0;
+  }
+
+  return written;
 }
 
 // =======================================================
 //  Wi-Fi + MQTT connectivity
 // =======================================================
 void startWifiAttempt(const char *ssid, const char *pwd) {
-  WiFi.disconnect();
+  WiFi.disconnect(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.persistent(false);
@@ -297,16 +398,12 @@ void ensureConnectivity() {
       wifiConnecting = false;
       wifiAttemptCount = 0;
 
-      if (!timeInitialized) {
-        initTime();
-        timeInitialized = true;
-        Serial.println("[DEBUG] Time initialized");
-      }
-
       if (!webOtaInitialized) {
         initWebOTA();
       }
     }
+
+    maintainTimeSync();
 
     if (!client.connected() && (now - lastMqttAttempt) > MQTT_RETRY_INTERVAL_MS) {
       lastMqttAttempt = now;
@@ -315,21 +412,24 @@ void ensureConnectivity() {
 
       if (client.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
         Serial.println("\n[DEBUG] MQTT connected");
+
         {
           String tstr = nowTimeString();
           char payload[96];
           snprintf(payload, sizeof(payload),
-                  "{\"status\":\"connected\",\"time\":\"%s\"}",
-                  tstr.c_str());
+                   "{\"status\":\"connected\",\"time\":\"%s\"}",
+                   tstr.c_str());
           client.publish(START_TOPIC, (const uint8_t*)payload, strlen(payload), false);
         }
 
         if (dayCount > 0) {
           size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
-          if (n > 0 && n < sizeof(MQTT_OUTBUF) - 1) {
+          if (n > 0) {
             bool ok = client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
             Serial.println(ok ? "[HOURLY] Reconnect snapshot published"
                               : "[HOURLY] Reconnect snapshot publish FAILED");
+          } else {
+            Serial.println("[HOURLY] JSON build failed on reconnect");
           }
         }
       } else {
@@ -342,19 +442,19 @@ void ensureConnectivity() {
   if (wifiConnecting) {
     if ((now - lastWifiBegin) > WIFI_RESET_STALE_MS) {
       Serial.println("[DEBUG] WiFi stuck connecting -> Force Resetting WiFi stack");
-      WiFi.disconnect(true);
+      WiFi.disconnect(false);
       delay(100);
       WiFi.mode(WIFI_OFF);
       delay(100);
       wifiConnecting = false;
       webOtaInitialized = false;
-    }
-    else if ((now - lastWifiBegin) > WIFI_BEGIN_INTERVAL_MS) {
+      ntpRequestStarted = false;
+    } else if ((now - lastWifiBegin) > WIFI_BEGIN_INTERVAL_MS) {
       Serial.println("[DEBUG] Connection timed out (soft). marking as failed.");
       wifiConnecting = false;
       webOtaInitialized = false;
-    }
-    else {
+      ntpRequestStarted = false;
+    } else {
       return;
     }
   }
@@ -378,8 +478,8 @@ void sendImpulseData(float volume, float hourTotal, const String &timeStr) {
   snprintf(payload, sizeof(payload),
            "{\"volume\":%.2f,\"hour_total\":%.2f,\"time\":\"%s\"}",
            volume, hourTotal, timeStr.c_str());
-  bool ok = client.publish(IMPULSE_TOPIC, (const uint8_t*)payload, strlen(payload), false);
 
+  bool ok = client.publish(IMPULSE_TOPIC, (const uint8_t*)payload, strlen(payload), false);
   if (!ok) {
     Serial.println("[DEBUG] Impulse publish failed");
   }
@@ -421,12 +521,12 @@ void handleHourRollover() {
 
   if (client.connected()) {
     size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
-    if (n > 0 && n < sizeof(MQTT_OUTBUF) - 1) {
+    if (n > 0) {
       bool ok = client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
       Serial.println(ok ? "[HOURLY] Weekly snapshot published"
                         : "[HOURLY] Weekly snapshot publish FAILED");
     } else {
-      Serial.printf("[HOURLY] JSON too large for buffer (%u bytes)\n", (unsigned)n);
+      Serial.println("[HOURLY] JSON build failed");
     }
   } else {
     Serial.println("[HOURLY] MQTT down, snapshot queued.");
@@ -435,25 +535,42 @@ void handleHourRollover() {
 
 void maybeSendWeeklySnapshot() {
   struct tm t;
-  if (!nowLocal(t)) return;
+  if (!nowLocal(t) || !isTimeSanityCheckOk()) {
+    static unsigned long lastWarn = 0;
+    if (millis() - lastWarn > 30000) {
+      Serial.println("[DEBUG] maybeSendWeeklySnapshot(): no valid local time yet");
+      lastWarn = millis();
+    }
+    return;
+  }
 
   int hourNow = t.tm_hour;
 
-  if (lastTrackedHour < 0) {
+  if (!rainfallClockReady) {
     lastTrackedHour = hourNow;
+
     char today[11];
     formatDate(t, today);
     if (findDayIndexByDate(today) == -1) startNewDay(today);
-    Serial.printf("[DEBUG] Init lastTrackedHour=%d\n", hourNow);
+
+    portENTER_CRITICAL(&rainMux);
+    impulseCount = 0;
+    impulseDetectedFlag = false;
+    portEXIT_CRITICAL(&rainMux);
+
+    rainfallClockReady = true;
+    Serial.printf("[DEBUG] Rainfall clock READY at %02d:00. Pre-sync data cleared.\n", hourNow);
     return;
   }
 
   if (hourNow != lastTrackedHour) {
     Serial.printf("[DEBUG] Hour change: %d -> %d\n", lastTrackedHour, hourNow);
     handleHourRollover();
+
     char today[11];
     formatDate(t, today);
     if (findDayIndexByDate(today) == -1) startNewDay(today);
+
     lastTrackedHour = hourNow;
   }
 }
@@ -464,7 +581,18 @@ void maybeSendWeeklySnapshot() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+
   Serial.printf("[DEBUG] Boot. MQTT_BUFFER_SIZE=%d\n", MQTT_BUFFER_SIZE);
+  Serial.printf("[BOOT] Reset reason: %s\n", resetReasonToStr(esp_reset_reason()));
+  Serial.printf("[DEBUG] Free heap at boot: %u bytes\n", ESP.getFreeHeap());
+
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = WDT_TIMEOUT_MS,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&twdt_config);
+  registerWatchdogForCurrentTask();
 
   for (int i = 0; i < 7; ++i) {
     weekBuf[i].used = false;
@@ -480,17 +608,27 @@ void setup() {
   client.setServer(MQTT_SERVER, 1883);
   client.setBufferSize(MQTT_BUFFER_SIZE + 512);
 
+  Serial.printf("[DEBUG] MQTT client buffer size set to: %u bytes\n",
+                (unsigned)(MQTT_BUFFER_SIZE + 512));
+
   WiFi.mode(WIFI_OFF);
+  delay(100);
   startWifiAttempt(SSID_PRIMARY, PASS_PRIMARY);
 }
 
 void loop() {
+  if (wdtRegistered) esp_task_wdt_reset();
+
   ensureConnectivity();
+
+  if (wdtRegistered) esp_task_wdt_reset();
 
   if (WiFi.status() == WL_CONNECTED && webOtaInitialized) {
     server.handleClient();
     ElegantOTA.loop();
   }
+
+  if (wdtRegistered) esp_task_wdt_reset();
 
   if (client.connected()) client.loop();
 
@@ -503,15 +641,22 @@ void loop() {
   portEXIT_CRITICAL(&rainMux);
 
   if (hadImpulse) {
-    String tstr = nowTimeString();
-    float currentHourRainfall = tipsSnapshot * rainfallPerImpulse;
-    Serial.printf("Rainfall impulse detected at %s | current hour: %.2f mm\n",
-                  tstr.c_str(), currentHourRainfall);
+    if (rainfallClockReady) {
+      String tstr = nowTimeString();
+      float currentHourRainfall = tipsSnapshot * rainfallPerImpulse;
 
-    if (client.connected()) {
-      sendImpulseData(rainfallPerImpulse, currentHourRainfall, tstr);
+      Serial.printf("Rainfall impulse detected at %s | current hour: %.2f mm\n",
+                    tstr.c_str(), currentHourRainfall);
+
+      if (client.connected()) {
+        sendImpulseData(rainfallPerImpulse, currentHourRainfall, tstr);
+      }
+    } else {
+      Serial.println("[DEBUG] Impulse ignored (waiting for clock sync)");
     }
   }
 
   maybeSendWeeklySnapshot();
+
+  if (wdtRegistered) esp_task_wdt_reset();
 }
