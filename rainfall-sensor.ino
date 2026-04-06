@@ -225,7 +225,6 @@ void maintainTimeSync() {
   }
 
   timeValid = false;
-  rainfallClockReady = false;
 
   const unsigned long nowMs = millis();
   if (!ntpRequestStarted || (nowMs - lastNtpAttempt) >= NTP_RETRY_INTERVAL_MS) {
@@ -316,8 +315,23 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
     }
   }
 
+  int daysAdded = 0;
+
   for (int oi = 0; oi < n; ++oi) {
     DayHours &d = weekBuf[order[oi]];
+
+    bool hasAnyHour = false;
+    for (int h = 0; h < 24; ++h) {
+      if (d.hasValue[h]) {
+        hasAnyHour = true;
+        break;
+      }
+    }
+
+    if (!hasAnyHour) {
+      continue;
+    }
+
     JsonArray arr = doc[d.date].to<JsonArray>();
     JsonObject hoursObj = arr.add<JsonObject>();
 
@@ -338,6 +352,13 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
 
       hoursObj[hourKey] = val;
     }
+
+    daysAdded++;
+  }
+
+  if (daysAdded == 0) {
+    Serial.println("[DEBUG] No hourly data yet, snapshot not published");
+    return 0;
   }
 
   if (doc.overflowed()) {
@@ -349,7 +370,6 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
   size_t jsonLen = measureJson(doc);
   Serial.printf("[DEBUG] JSON measured size: %u bytes (buffer: %u)\n",
                 (unsigned)jsonLen, (unsigned)outCap);
-  Serial.printf("[DEBUG] Free heap during JSON build: %u bytes\n", ESP.getFreeHeap());
 
   if (jsonLen >= outCap) {
     Serial.println("[ERROR] JSON does not fit into MQTT buffer!");
@@ -357,8 +377,6 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
   }
 
   size_t written = serializeJson(doc, out, outCap);
-  Serial.printf("[DEBUG] JSON serialized size: %u bytes\n", (unsigned)written);
-
   if (written == 0) {
     Serial.println("[ERROR] serializeJson() failed");
     return 0;
@@ -429,7 +447,7 @@ void ensureConnectivity() {
             Serial.println(ok ? "[HOURLY] Reconnect snapshot published"
                               : "[HOURLY] Reconnect snapshot publish FAILED");
           } else {
-            Serial.println("[HOURLY] JSON build failed on reconnect");
+            Serial.println("[HOURLY] Snapshot not published on reconnect");
           }
         }
       } else {
@@ -526,7 +544,7 @@ void handleHourRollover() {
       Serial.println(ok ? "[HOURLY] Weekly snapshot published"
                         : "[HOURLY] Weekly snapshot publish FAILED");
     } else {
-      Serial.println("[HOURLY] JSON build failed");
+      Serial.println("[HOURLY] Snapshot not published");
     }
   } else {
     Serial.println("[HOURLY] MQTT down, snapshot queued.");
@@ -535,7 +553,7 @@ void handleHourRollover() {
 
 void maybeSendWeeklySnapshot() {
   struct tm t;
-  if (!nowLocal(t) || !isTimeSanityCheckOk()) {
+  if (!timeValid || !nowLocal(t)) {
     static unsigned long lastWarn = 0;
     if (millis() - lastWarn > 30000) {
       Serial.println("[DEBUG] maybeSendWeeklySnapshot(): no valid local time yet");
