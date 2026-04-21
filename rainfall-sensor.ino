@@ -10,6 +10,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
+#include "esp_sntp.h"
 
 // =======================================================
 //  Private configuration
@@ -24,12 +25,12 @@
 // =======================================================
 //  Rain gauge setup
 // =======================================================
-const int   rainfallPin        = 27;       // GPIO27
-const float rainfallPerImpulse = 0.28f;    // mm per tip
+const int   rainfallPin        = 27;
+const float rainfallPerImpulse = 0.28f;
 
 // Noise / debounce parameters
-static const uint32_t MIN_LOW_US     = 5000;    // 5 ms minimum valid low
-static const uint32_t REFRACTORY_US  = 20000;   // 20 ms ignore window after valid tip
+static const uint32_t MIN_LOW_US     = 5000;
+static const uint32_t REFRACTORY_US  = 20000;
 
 // =======================================================
 //  Connectivity timing configuration
@@ -39,6 +40,7 @@ const unsigned long WIFI_BEGIN_INTERVAL_MS = 15000;
 const unsigned long WIFI_RESET_STALE_MS    = 30000;
 const unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
 const unsigned long NTP_RETRY_INTERVAL_MS  = 60000;
+const unsigned long TIME_STABLE_MS         = 10000;
 
 // =======================================================
 //  Watchdog configuration
@@ -59,7 +61,7 @@ bool rainfallClockReady = false;
 
 // ---- Rolling 7-day × 24-hour rainfall log ----
 struct DayHours {
-  char  date[11];          // "YYYY-MM-DD"
+  char  date[11];
   float hours[24];
   bool  hasValue[24];
   bool  used;
@@ -86,6 +88,13 @@ bool timeValid                = false;
 unsigned long lastNtpAttempt  = 0;
 bool webOtaInitialized        = false;
 
+// --- Time stability tracking ---
+time_t lastAcceptedTime         = 0;
+unsigned long timeStableSinceMs = 0;
+bool ntpTimeStable              = false;
+bool startTopicSentForSession   = false;
+volatile bool sntpSynced        = false;
+
 // Critical-section lock
 portMUX_TYPE rainMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -110,14 +119,36 @@ const char* resetReasonToStr(esp_reset_reason_t r) {
   }
 }
 
-bool isTimeSanityCheckOk() {
+bool isTimeReasonable() {
   time_t now = time(nullptr);
   if (now <= 0) return false;
 
-  struct tm t;
-  if (localtime_r(&now, &t) == nullptr) return false;
+  const time_t MIN_REASONABLE = 1735689600; // 2025-01-01 00:00:00 UTC
+  const time_t MAX_REASONABLE = 2051222400; // 2035-01-01 00:00:00 UTC
 
-  return (t.tm_year >= 124);   // 2024+
+  return (now >= MIN_REASONABLE && now <= MAX_REASONABLE);
+}
+
+void logCurrentTimeDebug(const char* prefix) {
+  time_t now = time(nullptr);
+  if (now <= 0) {
+    Serial.printf("[DEBUG] %s | time(nullptr) invalid: %lld\n", prefix, (long long)now);
+    return;
+  }
+
+  struct tm lt;
+  struct tm ut;
+  char lbuf[32];
+  char ubuf[32];
+
+  localtime_r(&now, &lt);
+  gmtime_r(&now, &ut);
+
+  strftime(lbuf, sizeof(lbuf), "%Y-%m-%d %H:%M:%S", &lt);
+  strftime(ubuf, sizeof(ubuf), "%Y-%m-%d %H:%M:%S", &ut);
+
+  Serial.printf("[DEBUG] %s | local=%s | utc=%s | epoch=%lld\n",
+                prefix, lbuf, ubuf, (long long)now);
 }
 
 void registerWatchdogForCurrentTask() {
@@ -140,6 +171,26 @@ void applyTimezone() {
   setenv("TZ", TZ_RULE, 1);
   tzset();
   Serial.printf("[DEBUG] Timezone applied: %s\n", TZ_RULE);
+}
+
+void onTimeSync(struct timeval *tv) {
+  sntpSynced = true;
+  Serial.println("[NTP] Time sync callback received");
+  logCurrentTimeDebug("SNTP callback");
+}
+
+void clearWeeklyBuffer() {
+  for (int i = 0; i < 7; ++i) {
+    weekBuf[i].used = false;
+    weekBuf[i].date[0] = '\0';
+    for (int h = 0; h < 24; ++h) {
+      weekBuf[i].hours[h] = 0.0f;
+      weekBuf[i].hasValue[h] = false;
+    }
+  }
+  currentDayPos = -1;
+  dayCount = 0;
+  Serial.println("[DEBUG] Weekly rainfall buffer cleared");
 }
 
 // =======================================================
@@ -212,8 +263,22 @@ void IRAM_ATTR handleRainfall() {
 // =======================================================
 //  Time helpers
 // =======================================================
+void resetTimeSyncState() {
+  timeValid = false;
+  ntpTimeStable = false;
+  rainfallClockReady = false;
+  ntpRequestStarted = false;
+  lastAcceptedTime = 0;
+  timeStableSinceMs = 0;
+  startTopicSentForSession = false;
+  sntpSynced = false;
+}
+
 void startNtpSync() {
   Serial.println("[DEBUG] startNtpSync(): calling configTzTime()");
+  sntpSynced = false;
+  sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+  sntp_set_time_sync_notification_cb(onTimeSync);
   configTzTime(TZ_RULE, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
   ntpRequestStarted = true;
   lastNtpAttempt = millis();
@@ -221,22 +286,81 @@ void startNtpSync() {
 
 void maintainTimeSync() {
   if (WiFi.status() != WL_CONNECTED) {
+    resetTimeSyncState();
     return;
   }
 
-  if (isTimeSanityCheckOk()) {
-    timeValid = true;
+  const unsigned long nowMs = millis();
+
+  if (!ntpRequestStarted) {
+    Serial.println("[DEBUG] NTP not started yet");
+    startNtpSync();
+    return;
+  }
+
+  sntp_sync_status_t syncStatus = sntp_get_sync_status();
+
+  if (!sntpSynced && syncStatus != SNTP_SYNC_STATUS_COMPLETED) {
+    timeValid = false;
+    ntpTimeStable = false;
+    rainfallClockReady = false;
+
+    if ((nowMs - lastNtpAttempt) >= NTP_RETRY_INTERVAL_MS) {
+      Serial.println("[DEBUG] Waiting for SNTP sync, retrying");
+      startNtpSync();
+    }
+    return;
+  }
+
+  if (!isTimeReasonable()) {
+    timeValid = false;
+    ntpTimeStable = false;
+    rainfallClockReady = false;
+
+    if ((nowMs - lastNtpAttempt) >= NTP_RETRY_INTERVAL_MS) {
+      Serial.println("[DEBUG] Time synced but unreasonable, retrying NTP");
+      startNtpSync();
+    }
+    return;
+  }
+
+  time_t now = time(nullptr);
+
+  if (lastAcceptedTime == 0) {
+    lastAcceptedTime = now;
+    timeStableSinceMs = nowMs;
+    timeValid = false;
+    ntpTimeStable = false;
+    logCurrentTimeDebug("First SNTP-synced reasonable time seen");
+    return;
+  }
+
+  if (labs((long)(now - lastAcceptedTime)) > 5) {
+    Serial.printf("[DEBUG] Time jump detected after SNTP: prev=%lld now=%lld diff=%ld s\n",
+                  (long long)lastAcceptedTime, (long long)now, (long)(now - lastAcceptedTime));
+    lastAcceptedTime = now;
+    timeStableSinceMs = nowMs;
+    timeValid = false;
+    ntpTimeStable = false;
+    logCurrentTimeDebug("Time jump reset");
+    return;
+  }
+
+  lastAcceptedTime = now;
+
+  if ((nowMs - timeStableSinceMs) >= TIME_STABLE_MS) {
+    if (!ntpTimeStable) {
+      ntpTimeStable = true;
+      timeValid = true;
+      logCurrentTimeDebug("Time became stable after confirmed SNTP sync");
+    } else {
+      timeValid = true;
+    }
     return;
   }
 
   timeValid = false;
-  rainfallClockReady = false;
-
-  const unsigned long nowMs = millis();
-  if (!ntpRequestStarted || (nowMs - lastNtpAttempt) >= NTP_RETRY_INTERVAL_MS) {
-    Serial.println("[DEBUG] Time invalid, retrying NTP sync");
-    startNtpSync();
-  }
+  ntpTimeStable = false;
 }
 
 bool nowLocal(struct tm &out) {
@@ -394,6 +518,92 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
 }
 
 // =======================================================
+//  MQTT publish helpers
+// =======================================================
+void publishStartTopicIfReady() {
+  if (!client.connected()) return;
+  if (startTopicSentForSession) return;
+  if (!timeValid || !ntpTimeStable) return;
+
+  String tstr = nowTimeString();
+  char payload[96];
+  snprintf(payload, sizeof(payload),
+           "{\"status\":\"connected\",\"time\":\"%s\"}",
+           tstr.c_str());
+
+  bool ok = client.publish(START_TOPIC, (const uint8_t*)payload, strlen(payload), false);
+  if (ok) {
+    startTopicSentForSession = true;
+    Serial.printf("[DEBUG] START_TOPIC published with stable time: %s\n", tstr.c_str());
+  } else {
+    Serial.println("[DEBUG] START_TOPIC publish failed");
+  }
+}
+
+void sendImpulseData(float volume, float hourTotal, const String &timeStr) {
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+           "{\"volume\":%.2f,\"hour_total\":%.2f,\"time\":\"%s\"}",
+           volume, hourTotal, timeStr.c_str());
+
+  bool ok = client.publish(IMPULSE_TOPIC, (const uint8_t*)payload, strlen(payload), false);
+  if (!ok) {
+    Serial.println("[DEBUG] Impulse publish failed");
+  }
+}
+
+void handleHourRollover() {
+  struct tm nowTm;
+  if (!nowLocal(nowTm)) {
+    Serial.println("[DEBUG] nowLocal() failed in handleHourRollover()");
+    return;
+  }
+
+  time_t nowTs = mktime(&nowTm);
+  if (nowTs <= 0) {
+    Serial.println("[DEBUG] mktime() failed in handleHourRollover()");
+    return;
+  }
+
+  time_t bucketEndTs = nowTs - 1;
+  struct tm bucketEndTm;
+  localtime_r(&bucketEndTs, &bucketEndTm);
+
+  char dateStr[11];
+  formatDate(bucketEndTm, dateStr);
+  int bucketHour = bucketEndTm.tm_hour;
+
+  char dbg[32];
+  strftime(dbg, sizeof(dbg), "%Y-%m-%d %H:%M:%S", &bucketEndTm);
+  Serial.printf("[DEBUG] handleHourRollover(): bucket end timestamp = %s\n", dbg);
+
+  unsigned long tips;
+  portENTER_CRITICAL(&rainMux);
+  tips = impulseCount;
+  impulseCount = 0;
+  portEXIT_CRITICAL(&rainMux);
+
+  float currentRainfallVolume = tips * rainfallPerImpulse;
+  Serial.printf("[DEBUG] handleHourRollover(): tips=%lu volume=%.2f\n",
+                tips, currentRainfallVolume);
+
+  setHourValue(dateStr, bucketHour, currentRainfallVolume);
+
+  if (client.connected()) {
+    size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
+    if (n > 0) {
+      bool ok = client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
+      Serial.println(ok ? "[HOURLY] Weekly snapshot published"
+                        : "[HOURLY] Weekly snapshot publish FAILED");
+    } else {
+      Serial.println("[HOURLY] No non-empty snapshot to publish");
+    }
+  } else {
+    Serial.println("[HOURLY] MQTT down, snapshot queued.");
+  }
+}
+
+// =======================================================
 //  Wi-Fi + MQTT connectivity
 // =======================================================
 void startWifiAttempt(const char *ssid, const char *pwd) {
@@ -438,30 +648,16 @@ void ensureConnectivity() {
 
       if (client.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
         Serial.println("\n[DEBUG] MQTT connected");
+        startTopicSentForSession = false;
 
-        {
-          String tstr = nowTimeString();
-          char payload[96];
-          snprintf(payload, sizeof(payload),
-                   "{\"status\":\"connected\",\"time\":\"%s\"}",
-                   tstr.c_str());
-          client.publish(START_TOPIC, (const uint8_t*)payload, strlen(payload), false);
-        }
-
-        if (dayCount > 0) {
-          size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
-          if (n > 0) {
-            bool ok = client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
-            Serial.println(ok ? "[HOURLY] Reconnect snapshot published"
-                              : "[HOURLY] Reconnect snapshot publish FAILED");
-          } else {
-            Serial.println("[HOURLY] No non-empty snapshot to publish on reconnect");
-          }
-        }
+        // Hourly snapshot sa po reconnecte NESMIE automaticky posielať.
+        Serial.println("[HOURLY] Reconnect snapshot suppressed");
       } else {
         Serial.printf(" failed, rc=%d\n", client.state());
       }
     }
+
+    publishStartTopicIfReady();
     return;
   }
 
@@ -474,12 +670,12 @@ void ensureConnectivity() {
       delay(100);
       wifiConnecting = false;
       webOtaInitialized = false;
-      ntpRequestStarted = false;
+      resetTimeSyncState();
     } else if ((now - lastWifiBegin) > WIFI_BEGIN_INTERVAL_MS) {
       Serial.println("[DEBUG] Connection timed out (soft). marking as failed.");
       wifiConnecting = false;
       webOtaInitialized = false;
-      ntpRequestStarted = false;
+      resetTimeSyncState();
     } else {
       return;
     }
@@ -496,79 +692,12 @@ void ensureConnectivity() {
   }
 }
 
-// =======================================================
-//  MQTT publish helpers
-// =======================================================
-void sendImpulseData(float volume, float hourTotal, const String &timeStr) {
-  char payload[160];
-  snprintf(payload, sizeof(payload),
-           "{\"volume\":%.2f,\"hour_total\":%.2f,\"time\":\"%s\"}",
-           volume, hourTotal, timeStr.c_str());
-
-  bool ok = client.publish(IMPULSE_TOPIC, (const uint8_t*)payload, strlen(payload), false);
-  if (!ok) {
-    Serial.println("[DEBUG] Impulse publish failed");
-  }
-}
-
-void handleHourRollover() {
-  struct tm nowTm;
-  if (!nowLocal(nowTm)) {
-    Serial.println("[DEBUG] nowLocal() failed in handleHourRollover()");
-    return;
-  }
-
-  time_t nowTs = mktime(&nowTm);
-  if (nowTs <= 0) {
-    Serial.println("[DEBUG] mktime() failed in handleHourRollover()");
-    return;
-  }
-
-  // Koniec uzavretého hourly bucketu = aktuálny čas - 1 sekunda
-  time_t bucketEndTs = nowTs - 1;
-  struct tm bucketEndTm;
-  localtime_r(&bucketEndTs, &bucketEndTm);
-
-  char dateStr[11];
-  formatDate(bucketEndTm, dateStr);
-  int bucketHour = bucketEndTm.tm_hour;
-
-  char dbg[32];
-  strftime(dbg, sizeof(dbg), "%Y-%m-%d %H:%M:%S", &bucketEndTm);
-  Serial.printf("[DEBUG] handleHourRollover(): bucket end timestamp = %s\n", dbg);
-
-  unsigned long tips;
-  portENTER_CRITICAL(&rainMux);
-  tips = impulseCount;
-  impulseCount = 0;
-  portEXIT_CRITICAL(&rainMux);
-
-  float currentRainfallVolume = tips * rainfallPerImpulse;
-  Serial.printf("[DEBUG] handleHourRollover(): tips=%lu volume=%.2f\n",
-                tips, currentRainfallVolume);
-
-  setHourValue(dateStr, bucketHour, currentRainfallVolume);
-
-  if (client.connected()) {
-    size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
-    if (n > 0) {
-      bool ok = client.publish(HOURLY_TOPIC, (const uint8_t*)MQTT_OUTBUF, n, true);
-      Serial.println(ok ? "[HOURLY] Weekly snapshot published"
-                        : "[HOURLY] Weekly snapshot publish FAILED");
-    } else {
-      Serial.println("[HOURLY] No non-empty snapshot to publish");
-    }
-  } else {
-    Serial.println("[HOURLY] MQTT down, snapshot queued.");
-  }
-}
-
 void maybeSendWeeklySnapshot() {
   struct tm t;
-  if (!nowLocal(t) || !isTimeSanityCheckOk()) {
+  if (!nowLocal(t) || !timeValid || !ntpTimeStable) {
     static unsigned long lastWarn = 0;
     if (millis() - lastWarn > 30000) {
-      Serial.println("[DEBUG] maybeSendWeeklySnapshot(): no valid local time yet");
+      Serial.println("[DEBUG] maybeSendWeeklySnapshot(): time not stable yet");
       lastWarn = millis();
     }
     return;
@@ -577,11 +706,14 @@ void maybeSendWeeklySnapshot() {
   int hourNow = t.tm_hour;
 
   if (!rainfallClockReady) {
+    // Pri prvom stabilnom čase zahodíme všetko, čo mohlo vzniknúť pred SNTP sync
+    clearWeeklyBuffer();
+
     lastTrackedHour = hourNow;
 
     char today[11];
     formatDate(t, today);
-    if (findDayIndexByDate(today) == -1) startNewDay(today);
+    startNewDay(today);
 
     portENTER_CRITICAL(&rainMux);
     impulseCount = 0;
@@ -618,6 +750,10 @@ void setup() {
 
   applyTimezone();
 
+  time_t bootNow = time(nullptr);
+  Serial.printf("[DEBUG] Raw time at boot before WiFi/NTP: %lld\n", (long long)bootNow);
+  logCurrentTimeDebug("Boot time before sync");
+
   esp_task_wdt_config_t twdt_config = {
     .timeout_ms = WDT_TIMEOUT_MS,
     .idle_core_mask = 0,
@@ -626,13 +762,7 @@ void setup() {
   esp_task_wdt_init(&twdt_config);
   registerWatchdogForCurrentTask();
 
-  for (int i = 0; i < 7; ++i) {
-    weekBuf[i].used = false;
-    for (int h = 0; h < 24; ++h) {
-      weekBuf[i].hours[h] = 0.0f;
-      weekBuf[i].hasValue[h] = false;
-    }
-  }
+  clearWeeklyBuffer();
 
   pinMode(rainfallPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(rainfallPin), handleRainfall, CHANGE);
@@ -642,6 +772,8 @@ void setup() {
 
   Serial.printf("[DEBUG] MQTT client buffer size set to: %u bytes\n",
                 (unsigned)(MQTT_BUFFER_SIZE + 512));
+
+  resetTimeSyncState();
 
   WiFi.mode(WIFI_OFF);
   delay(100);
@@ -673,7 +805,7 @@ void loop() {
   portEXIT_CRITICAL(&rainMux);
 
   if (hadImpulse) {
-    if (rainfallClockReady) {
+    if (rainfallClockReady && timeValid && ntpTimeStable) {
       String tstr = nowTimeString();
       float currentHourRainfall = tipsSnapshot * rainfallPerImpulse;
 
@@ -684,7 +816,7 @@ void loop() {
         sendImpulseData(rainfallPerImpulse, currentHourRainfall, tstr);
       }
     } else {
-      Serial.println("[DEBUG] Impulse ignored (waiting for clock sync)");
+      Serial.println("[DEBUG] Impulse ignored (waiting for stable clock sync)");
     }
   }
 
