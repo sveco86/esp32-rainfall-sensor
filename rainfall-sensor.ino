@@ -294,6 +294,11 @@ int startNewDay(const char date[11]) {
 }
 
 void setHourValue(const char date[11], int hour, float value) {
+  if (hour < 0 || hour > 23) {
+    Serial.printf("[ERROR] setHourValue(): invalid hour=%d for date=%s\n", hour, date);
+    return;
+  }
+
   int idx = findDayIndexByDate(date);
   if (idx == -1) idx = startNewDay(date);
 
@@ -343,8 +348,7 @@ static size_t buildWeeklySnapshotJson(char* out, size_t outCap) {
       if (!d.hasValue[h]) continue;
 
       char hourKey[9];
-      int displayHour = (h + 23) % 24;
-      snprintf(hourKey, sizeof(hourKey), "%02d:59:59", displayHour);
+      snprintf(hourKey, sizeof(hourKey), "%02d:59:59", h);
 
       char val[16];
       float v = d.hours[h];
@@ -508,26 +512,30 @@ void sendImpulseData(float volume, float hourTotal, const String &timeStr) {
 }
 
 void handleHourRollover() {
-  struct tm t;
-  if (!nowLocal(t)) {
+  struct tm nowTm;
+  if (!nowLocal(nowTm)) {
     Serial.println("[DEBUG] nowLocal() failed in handleHourRollover()");
     return;
   }
 
-  int hourNow = t.tm_hour;
-
-  struct tm assignTm = t;
-  if (hourNow == 0) {
-    time_t ts = mktime(&assignTm);
-    ts -= 1;
-    localtime_r(&ts, &assignTm);
+  time_t nowTs = mktime(&nowTm);
+  if (nowTs <= 0) {
+    Serial.println("[DEBUG] mktime() failed in handleHourRollover()");
+    return;
   }
 
-  char dateStr[11];
-  formatDate(assignTm, dateStr);
+  // Koniec uzavretého hourly bucketu = aktuálny čas - 1 sekunda
+  time_t bucketEndTs = nowTs - 1;
+  struct tm bucketEndTm;
+  localtime_r(&bucketEndTs, &bucketEndTm);
 
-  Serial.printf("[DEBUG] handleHourRollover(): endHour=%d date=%s\n",
-                hourNow, dateStr);
+  char dateStr[11];
+  formatDate(bucketEndTm, dateStr);
+  int bucketHour = bucketEndTm.tm_hour;
+
+  char dbg[32];
+  strftime(dbg, sizeof(dbg), "%Y-%m-%d %H:%M:%S", &bucketEndTm);
+  Serial.printf("[DEBUG] handleHourRollover(): bucket end timestamp = %s\n", dbg);
 
   unsigned long tips;
   portENTER_CRITICAL(&rainMux);
@@ -539,7 +547,7 @@ void handleHourRollover() {
   Serial.printf("[DEBUG] handleHourRollover(): tips=%lu volume=%.2f\n",
                 tips, currentRainfallVolume);
 
-  setHourValue(dateStr, hourNow, currentRainfallVolume);
+  setHourValue(dateStr, bucketHour, currentRainfallVolume);
 
   if (client.connected()) {
     size_t n = buildWeeklySnapshotJson(MQTT_OUTBUF, sizeof(MQTT_OUTBUF));
