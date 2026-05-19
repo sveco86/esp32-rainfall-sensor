@@ -56,6 +56,7 @@ int  lastTrackedHour    = -1;
 bool wdtRegistered      = false;
 bool rainfallClockReady = false;
 int mqttFailCount = 0;
+unsigned long clockReadyTs = 0;
 
 // ---- Rolling 7-day × 24-hour rainfall log ----
 struct DayHours {
@@ -731,6 +732,7 @@ void maybeSendWeeklySnapshot() {
     startNewDay(today);
     
     rainfallClockReady = true;
+    clockReadyTs = millis();
     Serial.printf("[DEBUG] Rainfall clock READY at %02d:00. Pre-sync data cleared.\n", hourNow);
     return;
   }
@@ -817,16 +819,32 @@ void loop() {
 
   if (hadImpulse) {
     if (rainfallClockReady && timeValid && ntpTimeStable) {
-      String tstr = nowTimeString();
       
-      // Vypočítame koľko impulzov reálne prebehlo od POSLEDNÉHO ÚSPEŠNÉHO odoslania
       unsigned long deltaTips = tipsSnapshot - lastSentImpulseCount;
-      float deltaVolume = deltaTips * rainfallPerImpulse;
-      float currentHourRainfall = tipsSnapshot * rainfallPerImpulse;
 
       if (deltaTips > 0) {
-        Serial.printf("Rainfall impulse detected at %s | delta: %.2f mm | hour total: %.2f mm\n",
-                      tstr.c_str(), deltaVolume, currentHourRainfall);
+        if (millis() - clockReadyTs < 5000) {
+          Serial.printf("[RF GUARD] %lu fake impulse(s) detected during Wi-Fi burst window. ERASING.\n", deltaTips);
+          
+          portENTER_CRITICAL(&rainMux);
+          if (impulseCount >= deltaTips) {
+            impulseCount -= deltaTips; // ÚPLNÉ VYMAZANIE: Stiahneme globálne počítadlo späť
+          } else {
+            impulseCount = 0;
+          }
+          portEXIT_CRITICAL(&rainMux);
+          
+        } 
+        else {
+          // =======================================================
+          //  ŠTANDARDNÉ ODOSIELANIE (Mimo ochranného okna)
+          // =======================================================
+          String tstr = nowTimeString();
+          float deltaVolume = deltaTips * rainfallPerImpulse;
+          float currentHourRainfall = tipsSnapshot * rainfallPerImpulse;
+
+          Serial.printf("Rainfall impulse detected at %s | delta: %.2f mm | hour total: %.2f mm\n",
+                        tstr.c_str(), deltaVolume, currentHourRainfall);
 
           if (client.connected()) {
             if (sendImpulseData(deltaVolume, currentHourRainfall, tstr)) {
@@ -837,6 +855,7 @@ void loop() {
           } else {
             Serial.println("[MQTT] Disconnected. Delta accumulation in progress...");
           }
+        }
       }
     } else {
       Serial.println("[DEBUG] Impulse ignored (waiting for stable clock sync)");
