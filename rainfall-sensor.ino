@@ -28,10 +28,6 @@
 const int   rainfallPin        = 27;
 const float rainfallPerImpulse = 0.28f;
 
-// Noise / debounce parameters
-static const uint32_t MIN_LOW_US     = 5000;
-static const uint32_t REFRACTORY_US  = 20000;
-
 // =======================================================
 //  Connectivity timing configuration
 // =======================================================
@@ -52,12 +48,13 @@ static const uint32_t WDT_TIMEOUT_MS = 10000;
 // =======================================================
 volatile unsigned long impulseCount        = 0;
 volatile bool          impulseDetectedFlag = false;
-volatile uint64_t      lowStartUs          = 0;
 volatile uint64_t      lastValidTipUs      = 0;
+volatile unsigned long lastSentImpulseCount = 0;
 
 int  lastTrackedHour    = -1;
 bool wdtRegistered      = false;
 bool rainfallClockReady = false;
+int mqttFailCount = 0;
 
 // ---- Rolling 7-day × 24-hour rainfall log ----
 struct DayHours {
@@ -238,25 +235,16 @@ void initWebOTA() {
 //  ISR – tipping-bucket pulse-width filter
 // =======================================================
 void IRAM_ATTR handleRainfall() {
-  int level = gpio_get_level((gpio_num_t)rainfallPin);
   uint64_t nowUs = esp_timer_get_time();
-
-  if (nowUs - lastValidTipUs < REFRACTORY_US) return;
-
-  if (level == 0) {
-    if (lowStartUs == 0) lowStartUs = nowUs;
-  } else {
-    if (lowStartUs != 0) {
-      uint64_t lowDur = nowUs - lowStartUs;
-      lowStartUs = 0;
-      if (lowDur >= MIN_LOW_US) {
-        portENTER_CRITICAL_ISR(&rainMux);
-        impulseCount++;
-        impulseDetectedFlag = true;
-        portEXIT_CRITICAL_ISR(&rainMux);
-        lastValidTipUs = nowUs;
-      }
-    }
+  
+  // Ak od posledného zopnutia prešlo viac ako 50 ms (50000 mikrosekúnd)
+  if (nowUs - lastValidTipUs > 50000) { 
+    portENTER_CRITICAL_ISR(&rainMux);
+    impulseCount++;
+    impulseDetectedFlag = true;
+    portEXIT_CRITICAL_ISR(&rainMux);
+    
+    lastValidTipUs = nowUs; // Zaznamenaj čas tohto preklopenia
   }
 }
 
@@ -304,11 +292,7 @@ void maintainTimeSync() {
     timeValid = false;
     ntpTimeStable = false;
     rainfallClockReady = false;
-
-    if ((nowMs - lastNtpAttempt) >= NTP_RETRY_INTERVAL_MS) {
-      Serial.println("[DEBUG] Waiting for SNTP sync, retrying");
-      startNtpSync();
-    }
+    // ODOBRANÉ cyklické volanie startNtpSync(). lwIP sa pokúša o reconnect sám na pozadí.
     return;
   }
 
@@ -581,6 +565,7 @@ void handleHourRollover() {
   portENTER_CRITICAL(&rainMux);
   tips = impulseCount;
   impulseCount = 0;
+  lastSentImpulseCount = 0;
   portEXIT_CRITICAL(&rainMux);
 
   float currentRainfallVolume = tips * rainfallPerImpulse;
@@ -641,7 +626,7 @@ void ensureConnectivity() {
 
     maintainTimeSync();
 
-    if (!client.connected() && (now - lastMqttAttempt) > MQTT_RETRY_INTERVAL_MS) {
+  if (!client.connected() && (now - lastMqttAttempt) > MQTT_RETRY_INTERVAL_MS) {
       lastMqttAttempt = now;
       client.setServer(MQTT_SERVER, 1883);
       Serial.print("[DEBUG] Connecting to MQTT");
@@ -649,11 +634,28 @@ void ensureConnectivity() {
       if (client.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
         Serial.println("\n[DEBUG] MQTT connected");
         startTopicSentForSession = false;
+        mqttFailCount = 0; // Reset počítadla pri úspechu
 
         // Hourly snapshot sa po reconnecte NESMIE automaticky posielať.
         Serial.println("[HOURLY] Reconnect snapshot suppressed");
       } else {
         Serial.printf(" failed, rc=%d\n", client.state());
+        mqttFailCount++;
+
+        // Ak zlyhá pripojenie 12x za sebou (cca 1 minúta permanentného výpadku)
+        if (mqttFailCount >= 12) {
+          Serial.println("[DEBUG] MQTT failed repeatedly. Forcing hard Wi-Fi reset to clear sockets...");
+          WiFi.disconnect(false);
+          delay(100);
+          WiFi.mode(WIFI_OFF);
+          delay(100);
+          
+          wifiConnecting = false;
+          webOtaInitialized = false;
+          resetTimeSyncState(); // Toto vráti ntpRequestStarted na false, takže po nábehu Wi-Fi znova inicializuje čistý SNTP dopyt
+          mqttFailCount = 0;
+          return; 
+        }
       }
     }
 
@@ -709,17 +711,19 @@ void maybeSendWeeklySnapshot() {
     // Pri prvom stabilnom čase zahodíme všetko, čo mohlo vzniknúť pred SNTP sync
     clearWeeklyBuffer();
 
+    // OPRAVA: Vynuluj počítadlá impulzov nazbierané počas bootu
+    portENTER_CRITICAL(&rainMux);
+    impulseCount = 0;
+    lastSentImpulseCount = 0;
+    impulseDetectedFlag = false;
+    portEXIT_CRITICAL(&rainMux);
+
     lastTrackedHour = hourNow;
 
     char today[11];
     formatDate(t, today);
     startNewDay(today);
-
-    portENTER_CRITICAL(&rainMux);
-    impulseCount = 0;
-    impulseDetectedFlag = false;
-    portEXIT_CRITICAL(&rainMux);
-
+    
     rainfallClockReady = true;
     Serial.printf("[DEBUG] Rainfall clock READY at %02d:00. Pre-sync data cleared.\n", hourNow);
     return;
@@ -765,7 +769,8 @@ void setup() {
   clearWeeklyBuffer();
 
   pinMode(rainfallPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(rainfallPin), handleRainfall, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(rainfallPin), handleRainfall, FALLING);
+
 
   client.setServer(MQTT_SERVER, 1883);
   client.setBufferSize(MQTT_BUFFER_SIZE + 512);
@@ -807,13 +812,23 @@ void loop() {
   if (hadImpulse) {
     if (rainfallClockReady && timeValid && ntpTimeStable) {
       String tstr = nowTimeString();
+      
+      // Vypočítame koľko impulzov reálne prebehlo od POSLEDNÉHO ÚSPEŠNÉHO odoslania
+      unsigned long deltaTips = tipsSnapshot - lastSentImpulseCount;
+      float deltaVolume = deltaTips * rainfallPerImpulse;
       float currentHourRainfall = tipsSnapshot * rainfallPerImpulse;
 
-      Serial.printf("Rainfall impulse detected at %s | current hour: %.2f mm\n",
-                    tstr.c_str(), currentHourRainfall);
+      if (deltaTips > 0) {
+        Serial.printf("Rainfall impulse detected at %s | delta: %.2f mm | hour total: %.2f mm\n",
+                      tstr.c_str(), deltaVolume, currentHourRainfall);
 
-      if (client.connected()) {
-        sendImpulseData(rainfallPerImpulse, currentHourRainfall, tstr);
+        if (client.connected()) {
+          sendImpulseData(deltaVolume, currentHourRainfall, tstr); 
+          // OPRAVA: Počítadlo posunúť SEM. Aktualizuje sa len pri online stave.
+          lastSentImpulseCount = tipsSnapshot; 
+        } else {
+          Serial.println("[MQTT] Disconnected. Delta accumulation in progress...");
+        }
       }
     } else {
       Serial.println("[DEBUG] Impulse ignored (waiting for stable clock sync)");
