@@ -37,6 +37,7 @@ const unsigned long WIFI_RESET_STALE_MS    = 30000;
 const unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
 const unsigned long NTP_RETRY_INTERVAL_MS  = 60000;
 const unsigned long TIME_STABLE_MS         = 10000;
+const uint64_t MIN_TIP_INTERVAL_US         = 250000; // 250 ms
 
 // =======================================================
 //  Watchdog configuration
@@ -234,18 +235,19 @@ void initWebOTA() {
 // =======================================================
 //  ISR – tipping-bucket pulse-width filter
 // =======================================================
+
 void IRAM_ATTR handleRainfall() {
   uint64_t nowUs = esp_timer_get_time();
-  
-  // Ak od posledného zopnutia prešlo viac ako 50 ms (50000 mikrosekúnd)
-  if (nowUs - lastValidTipUs > 50000) { 
-    portENTER_CRITICAL_ISR(&rainMux);
+
+  portENTER_CRITICAL_ISR(&rainMux);
+
+  if (nowUs - lastValidTipUs > MIN_TIP_INTERVAL_US) {
+    lastValidTipUs = nowUs;
     impulseCount++;
     impulseDetectedFlag = true;
-    portEXIT_CRITICAL_ISR(&rainMux);
-    
-    lastValidTipUs = nowUs; // Zaznamenaj čas tohto preklopenia
   }
+
+  portEXIT_CRITICAL_ISR(&rainMux);
 }
 
 // =======================================================
@@ -254,7 +256,7 @@ void IRAM_ATTR handleRainfall() {
 void resetTimeSyncState() {
   timeValid = false;
   ntpTimeStable = false;
-  rainfallClockReady = false;
+  //rainfallClockReady = false;
   ntpRequestStarted = false;
   lastAcceptedTime = 0;
   timeStableSinceMs = 0;
@@ -292,14 +294,15 @@ void maintainTimeSync() {
     timeValid = false;
     ntpTimeStable = false;
     rainfallClockReady = false;
-    // ODOBRANÉ cyklické volanie startNtpSync(). lwIP sa pokúša o reconnect sám na pozadí.
     return;
   }
 
   if (!isTimeReasonable()) {
     timeValid = false;
     ntpTimeStable = false;
-    rainfallClockReady = false;
+
+    // rainfallClockReady nemeníme.
+    // Ak už bolo meranie rozbehnuté, nechceme pri dočasnom probléme zahodiť dáta.
 
     if ((nowMs - lastNtpAttempt) >= NTP_RETRY_INTERVAL_MS) {
       Serial.println("[DEBUG] Time synced but unreasonable, retrying NTP");
@@ -524,16 +527,19 @@ void publishStartTopicIfReady() {
   }
 }
 
-void sendImpulseData(float volume, float hourTotal, const String &timeStr) {
+bool sendImpulseData(float volume, float hourTotal, const String &timeStr) {
   char payload[160];
   snprintf(payload, sizeof(payload),
            "{\"volume\":%.2f,\"hour_total\":%.2f,\"time\":\"%s\"}",
            volume, hourTotal, timeStr.c_str());
 
   bool ok = client.publish(IMPULSE_TOPIC, (const uint8_t*)payload, strlen(payload), false);
+
   if (!ok) {
     Serial.println("[DEBUG] Impulse publish failed");
   }
+
+  return ok;
 }
 
 void handleHourRollover() {
@@ -624,7 +630,7 @@ void ensureConnectivity() {
       }
     }
 
-    maintainTimeSync();
+      maintainTimeSync();
 
   if (!client.connected() && (now - lastMqttAttempt) > MQTT_RETRY_INTERVAL_MS) {
       lastMqttAttempt = now;
@@ -822,13 +828,15 @@ void loop() {
         Serial.printf("Rainfall impulse detected at %s | delta: %.2f mm | hour total: %.2f mm\n",
                       tstr.c_str(), deltaVolume, currentHourRainfall);
 
-        if (client.connected()) {
-          sendImpulseData(deltaVolume, currentHourRainfall, tstr); 
-          // OPRAVA: Počítadlo posunúť SEM. Aktualizuje sa len pri online stave.
-          lastSentImpulseCount = tipsSnapshot; 
-        } else {
-          Serial.println("[MQTT] Disconnected. Delta accumulation in progress...");
-        }
+          if (client.connected()) {
+            if (sendImpulseData(deltaVolume, currentHourRainfall, tstr)) {
+              lastSentImpulseCount = tipsSnapshot;
+            } else {
+              Serial.println("[MQTT] Publish failed. Delta will be retried with next impulse.");
+            }
+          } else {
+            Serial.println("[MQTT] Disconnected. Delta accumulation in progress...");
+          }
       }
     } else {
       Serial.println("[DEBUG] Impulse ignored (waiting for stable clock sync)");
